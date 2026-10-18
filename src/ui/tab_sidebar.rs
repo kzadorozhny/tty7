@@ -1754,10 +1754,7 @@ impl Tty7App {
             })
             .child(
                 crate::ui::app::resting_chrome(div().occlude().flex_shrink_0(), chrome_shown)
-                    // These are the same controls as the collapsed title bar's
-                    // pair. Keep their hit targets and glyphs unchanged when
-                    // the sidebar opens, rather than switching to row-sized tiles.
-                    .child(self.new_tab_button("sidebar-add", cx)),
+                    .child(self.sidebar_new_tab_split(cx)),
             )
             .child(
                 crate::ui::app::resting_chrome(div().occlude().flex_shrink_0(), chrome_shown)
