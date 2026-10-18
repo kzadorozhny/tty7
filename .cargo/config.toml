@@ -10,6 +10,10 @@ dev = "run -- --config-dir .tty7-dev"
 [net]
 git-fetch-with-cli = true
 
+# Require warning-free builds and checks by treating Rust warnings as errors.
+[build]
+rustflags = ["-D", "warnings"]
+
 # Link the Visual C++ runtime statically on Windows (#902).
 #
 # The default MSVC target links the CRT dynamically, so every shipped binary
