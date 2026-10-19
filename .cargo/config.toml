@@ -39,7 +39,7 @@ rustflags = ["-D", "warnings"]
 #     than adding to them. `.github/scripts/assert-no-vcruntime.ps1` is the
 #     backstop: it fails the build if VCRUNTIME140/MSVCP140 reappear.
 [target.x86_64-pc-windows-msvc]
-rustflags = ["-C", "target-feature=+crt-static"]
+rustflags = ["-D", "warnings", "-C", "target-feature=+crt-static"]
 
 [target.aarch64-pc-windows-msvc]
-rustflags = ["-C", "target-feature=+crt-static"]
+rustflags = ["-D", "warnings", "-C", "target-feature=+crt-static"]

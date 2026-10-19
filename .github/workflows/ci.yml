@@ -251,7 +251,7 @@ jobs:
     # rather than in [profile.release] because the release profile is shared with
     # the GUI builds, which keep their symbols.
     env:
-      RUSTFLAGS: -C strip=symbols
+      RUSTFLAGS: -D warnings -C strip=symbols
     steps:
       - uses: actions/checkout@v4
 
@@ -344,7 +344,7 @@ jobs:
           - target: x86_64-apple-darwin
             arch: x86_64
     env:
-      RUSTFLAGS: -C strip=symbols
+      RUSTFLAGS: -D warnings -C strip=symbols
     steps:
       - uses: actions/checkout@v4
 
