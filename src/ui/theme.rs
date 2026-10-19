@@ -319,12 +319,13 @@ pub(crate) const SYSTEM_MATERIAL_OPACITY: f32 = 0.82;
 /// 11 22H2 (build 22621), acrylic needs 1809 (build 17763); below that plain
 /// translucency is the best Windows can do. Pure function so the fallback
 /// table is unit-testable on every platform.
+#[cfg(any(target_os = "windows", test))]
 pub(crate) fn windows_background_appearance(
-    backdrop: WindowBackdrop,
+    _backdrop: WindowBackdrop,
     blur: bool,
     build: u32,
 ) -> WindowBackgroundAppearance {
-    match backdrop {
+    match _backdrop {
         WindowBackdrop::Auto => {
             if blur {
                 WindowBackgroundAppearance::Blurred
@@ -379,6 +380,7 @@ pub(crate) fn windows_background_appearance(
 /// render identically — hiding them beats misrepresenting them. Below 1809
 /// (17763) there is no blur API at all, so only plain translucency is left.
 /// Pure function so the table is unit-testable on every platform.
+#[cfg(any(target_os = "windows", test))]
 pub(crate) fn supported_backdrops_for(build: u32) -> &'static [WindowBackdrop] {
     if build >= 22_621 {
         &[
@@ -429,12 +431,12 @@ pub(crate) fn windows_build_number() -> u32 {
 }
 
 pub(crate) fn resolved_background_appearance(
-    backdrop: WindowBackdrop,
+    _backdrop: WindowBackdrop,
     blur: bool,
 ) -> WindowBackgroundAppearance {
     #[cfg(target_os = "windows")]
     {
-        windows_background_appearance(backdrop, blur, windows_build_number())
+        windows_background_appearance(_backdrop, blur, windows_build_number())
     }
     #[cfg(not(target_os = "windows"))]
     {
