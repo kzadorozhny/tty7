@@ -126,7 +126,7 @@ fn option_takes_value(flag: char) -> bool {
     )
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(crate) fn foreground_argv(pid: i32) -> Option<Vec<String>> {
     platform_foreground_argv(pid)
 }
@@ -214,11 +214,6 @@ fn parse_macos_procargs(buf: &[u8]) -> Option<Vec<String>> {
         }
     }
     (!argv.is_empty()).then_some(argv)
-}
-
-#[cfg(all(test, not(any(target_os = "linux", target_os = "macos"))))]
-fn platform_foreground_argv(_pid: i32) -> Option<Vec<String>> {
-    None
 }
 
 #[cfg(test)]
