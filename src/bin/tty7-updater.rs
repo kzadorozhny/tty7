@@ -2732,7 +2732,9 @@ mod windows {
                 let name = entry
                     .insecure_file_name
                     .as_str()
-                    .map_err(|error| format!("reading portable ZIP entry {index} name: {error}"))?
+                    .ok_or_else(|| {
+                        format!("reading portable ZIP entry {index} name: name is not UTF-8")
+                    })?
                     .to_owned();
                 let unix_mode = (entry.cdrh.v_made_by >> 8 == 3)
                     .then_some((entry.cdrh.exter_attr >> 16) as u16);
