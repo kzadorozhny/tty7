@@ -3413,7 +3413,7 @@ mod tests {
             ("image opacity", Appearance),
         ];
         #[cfg(target_os = "windows")]
-        cases.extend([
+        let cases = cases.into_iter().chain([
             ("material", Appearance),
             ("mica", Appearance),
             ("acrylic", Appearance),
