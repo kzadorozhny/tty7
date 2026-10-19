@@ -172,12 +172,11 @@ fn redirect_to_null(fd: libc::c_int) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::io::{Read as _, Write as _};
 
-    #[cfg(unix)]
     #[test]
     fn a_unix_stream_splits_into_working_halves() {
         use std::os::unix::net::UnixStream;
@@ -208,7 +207,6 @@ mod tests {
         let _ = reader.join().unwrap();
     }
 
-    #[cfg(unix)]
     #[test]
     fn a_shut_stdio_writer_refuses_further_writes() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
