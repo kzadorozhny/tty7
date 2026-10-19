@@ -2752,7 +2752,7 @@ mod windows {
             if unix_mode.is_some_and(|mode| mode & 0o170000 == 0o120000) {
                 return Err(format!("the portable ZIP contains a symbolic link: {name}"));
             }
-            let relative = PathBuf::from(name);
+            let relative = PathBuf::from(name.as_str());
             let key = portable_path_key(&relative)?;
             if !seen.insert(key) {
                 return Err(format!(
