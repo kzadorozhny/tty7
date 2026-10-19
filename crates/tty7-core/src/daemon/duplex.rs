@@ -1,5 +1,7 @@
 use std::io;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+#[cfg(unix)]
+use std::sync::Mutex;
 
 use crate::daemon::control::LinkShutdown;
 
