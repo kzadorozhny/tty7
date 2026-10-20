@@ -1264,7 +1264,7 @@ l10n_keys! {
     AppMenuWindow,
     AppMenuHelp,
     AppMenuNewTab,
-    SidebarNewTabMenu,
+    NewTabMoreOptions,
     AppMenuNewWorkspace,
     AppMenuNewWorktreeTab,
     AppMenuSplitRight,

@@ -1,8 +1,7 @@
 use gpui::{
-    Animation, AnimationExt as _, AnyElement, App, Axis, Bounds, Context, Div, Edges, ElementId,
-    FontWeight, Interactivity, MouseButton, Pixels, SharedString, Stateful, StyleRefinement,
-    Window, canvas, deferred, div, ease_out_quint, linear_color_stop, linear_gradient, prelude::*,
-    px,
+    Animation, AnimationExt as _, AnyElement, App, Axis, Bounds, Context, Div, Edges, FontWeight,
+    Interactivity, MouseButton, Pixels, SharedString, Stateful, StyleRefinement, Window, canvas,
+    deferred, div, ease_out_quint, linear_color_stop, linear_gradient, prelude::*, px,
 };
 use gpui_component::button::{Button, ButtonCustomVariant, ButtonVariants as _};
 use gpui_component::input::Input;
@@ -864,7 +863,7 @@ fn collapsed_rail_group_w() -> f32 {
         true => 0.,
         false => (CONTENT_INSET - tile_trailing_inset()) + WINDOW_MARK_SIZE + 4. + 2.,
     };
-    crate::ui::app::title_bar_hug_offset() + mark + TILE_SIZE + 2. + TILE_SIZE
+    crate::ui::app::title_bar_hug_offset() + mark + NEW_TAB_W + 2. + TILE_SIZE
 }
 
 /// How wide the New Tab menu is allowed to get.
@@ -1874,19 +1873,22 @@ impl Tty7App {
         (!raw.trim().is_empty()).then_some(raw)
     }
 
-    /// The New Tab control: one `+` that drops the list of everything it could
-    /// open — the installed shells, and the saved SSH hosts.
+    /// The New Tab control, in two halves: `+` opens a tab with the default
+    /// shell outright, and the chevron beside it drops the list of everything
+    /// else it could open — the installed shells, the agents, the saved SSH
+    /// hosts.
     ///
-    /// It was briefly split in two, a `+` that opened a tab outright next to a
-    /// caret for the list, the way Windows Terminal and VS Code split theirs.
-    /// That buys back the click the menu costs on the most common action, and
-    /// it costs a second mark in a row of single ones. This row is four icons
-    /// wide and reads as four icons; a fifth that was half of the fourth had
-    /// to earn its place by looking like a pair, and a pair is exactly what a
-    /// chrome row of plain icons has no vocabulary for.
+    /// It used to be one `+` that only ever dropped the list, with ⌘T standing
+    /// in for the click that cost. But a plain tab is what the button is
+    /// pressed for most, and routing every press through a menu charged that
+    /// click to everyone who reaches for the pointer rather than the chord. So
+    /// the pair is drawn as one tile split down the middle — each half hovers
+    /// on its own, square where they meet, rounded only at the outer edges —
+    /// and still reads as one control in a row of single ones.
     ///
-    /// So: one tile, drawn and hovered like every other tile beside it, and
-    /// the click it costs is answered by ⌘T rather than by a second button.
+    /// Every New Tab in the chrome comes through here — the strip, the
+    /// collapsed rail, the sidebar header — so `+` does the same thing
+    /// wherever it is, and the rail keeps the same control when it opens.
     pub(crate) fn new_tab_button(
         &self,
         id: &'static str,
@@ -1904,67 +1906,58 @@ impl Tty7App {
         cx: &Context<Self>,
     ) -> impl IntoElement + use<> {
         let app = cx.entity().downgrade();
-        let glyph = match tile < crate::ui::app::TILE_SIZE {
-            true => RAIL_TILE_GLYPH,
-            false => TILE_GLYPH,
-        };
-        chrome_tile_sized(
-            Button::new(id).icon(Icon::new(IconName::Plus)),
-            tile,
-            glyph,
-            false,
-            cx,
-        )
-        .rounded(px(RAIL_TILE_RADIUS))
-        // Every other tile in this row names itself on hover — Switch
-        // Workspace, More, Hide Sidebar. The three New Tab buttons that
-        // come through here were the ones left silent. The chord is worth
-        // more here than anywhere else in the row: it is the way back to
-        // opening a tab without reading a menu first.
-        .accessible_label(t(L10nKey::AppMenuNewTab))
-        .tooltip_element(chord_tooltip(t(L10nKey::AppMenuNewTab), "NewTab", cx))
-        // Built when the menu opens, not when the strip draws: this
-        // closure runs once per press, and again after each dismissal.
-        .dropdown_menu(move |menu, window, cx| {
-            let Some(this) = app.upgrade() else {
-                return menu;
-            };
-            this.read(cx)
-                .new_tab_menu_rows(app.clone(), cx)
-                .build(menu, window)
-        })
+        NewTabSplit::new(id, tile, app.clone())
+            // Built when the menu opens, not when the strip draws: this
+            // closure runs once per press, and again after each dismissal.
+            .dropdown_menu(move |menu, window, cx| {
+                let Some(this) = app.upgrade() else {
+                    return menu;
+                };
+                this.read(cx)
+                    .new_tab_menu_rows(app.clone(), cx)
+                    .build(menu, window)
+            })
     }
 }
 
-/// A composite split control for the sidebar header: the `+` button creates a
-/// default-shell tab immediately, while the chevron opens the [`NewTabMenu`].
+/// How wide [`Tty7App::new_tab_button`] is: the `+` tile and the chevron.
+/// Anything that budgets the title bar row around it counts it at this.
+pub(crate) const NEW_TAB_W: f32 = crate::ui::app::TILE_SIZE + MIN_TARGET;
+
+/// The two halves of [`Tty7App::new_tab_button`], as one trigger for the menu.
 ///
-/// Implements [`DropdownMenu`] so the popup menu is anchored to the cluster's
-/// top-left (aligning directly under the `+` button), and both halves render in
-/// the active/selected state while the menu is open.
+/// The menu wants a trigger it can mark selected while it is open, and that
+/// has to be the pair rather than the chevron alone: anchored to the chevron
+/// the list would open a tile's width to the right of the `+` it belongs to.
+/// The popover toggles on a press anywhere in the pair, so the `+` stops its
+/// own press from reaching it.
 #[derive(IntoElement)]
-pub(crate) struct SidebarNewTabSplit {
-    id: ElementId,
+struct NewTabSplit {
+    id: &'static str,
+    /// The pair's own box. The trigger traits hand out its interactivity, so
+    /// it is what renders — not a fresh `div` that would drop whatever was
+    /// hung on it.
     base: Stateful<Div>,
     style: StyleRefinement,
     selected: bool,
+    tile: f32,
     app: gpui::WeakEntity<Tty7App>,
 }
 
-impl SidebarNewTabSplit {
-    pub(crate) fn new(id: impl Into<ElementId>, app: gpui::WeakEntity<Tty7App>) -> Self {
-        let id = id.into();
+impl NewTabSplit {
+    fn new(id: &'static str, tile: f32, app: gpui::WeakEntity<Tty7App>) -> Self {
         Self {
-            id: id.clone(),
-            base: div().id(id),
+            id,
+            base: div().id(SharedString::from(format!("{id}-split"))),
             style: StyleRefinement::default(),
             selected: false,
+            tile,
             app,
         }
     }
 }
 
-impl Selectable for SidebarNewTabSplit {
+impl Selectable for NewTabSplit {
     fn selected(mut self, selected: bool) -> Self {
         self.selected = selected;
         self
@@ -1975,81 +1968,73 @@ impl Selectable for SidebarNewTabSplit {
     }
 }
 
-impl Styled for SidebarNewTabSplit {
+impl Styled for NewTabSplit {
     fn style(&mut self) -> &mut StyleRefinement {
         &mut self.style
     }
 }
 
-impl InteractiveElement for SidebarNewTabSplit {
+impl InteractiveElement for NewTabSplit {
     fn interactivity(&mut self) -> &mut Interactivity {
         self.base.interactivity()
     }
 }
 
-impl DropdownMenu for SidebarNewTabSplit {}
+impl DropdownMenu for NewTabSplit {}
 
-impl RenderOnce for SidebarNewTabSplit {
+impl RenderOnce for NewTabSplit {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let app = self.app.clone();
-        h_flex()
-            .id(SharedString::from(format!("{}-cluster", self.id)))
+        let glyph = match self.tile < crate::ui::app::TILE_SIZE {
+            true => RAIL_TILE_GLYPH,
+            false => TILE_GLYPH,
+        };
+        let app = self.app;
+        let half = |i| segment_corners(i, 2, px(RAIL_TILE_RADIUS), px(0.));
+        self.base
+            .flex()
             .flex_none()
             .items_center()
-            .h(px(crate::ui::app::TILE_SIZE))
+            .h(px(self.tile))
             .child(
-                chrome_tile(
-                    Button::new("sidebar-add").icon(Icon::new(IconName::Plus)),
+                chrome_tile_sized(
+                    Button::new(self.id).icon(Icon::new(IconName::Plus)),
+                    self.tile,
+                    glyph,
                     self.selected,
                     cx,
                 )
-                .rounded_corners(segment_corners(0, 2, px(RAIL_TILE_RADIUS), px(0.)))
+                .rounded_corners(half(0))
+                // Every other tile in this row names itself on hover. The
+                // chord is worth more here than anywhere else in the row: it
+                // is the way to a tab without reaching for the pointer at all.
                 .accessible_label(t(L10nKey::AppMenuNewTab))
                 .when(!self.selected, |b| {
                     b.tooltip_element(chord_tooltip(t(L10nKey::AppMenuNewTab), "NewTab", cx))
                 })
-                .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                    cx.stop_propagation();
-                })
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(move |_, window, cx| {
-                    if let Some(this) = app.upgrade() {
-                        this.update(cx, |this, cx| this.new_tab(window, cx));
-                    }
+                    let _ = app.update(cx, |this, cx| this.new_tab(window, cx));
                 }),
             )
             .child(
-                Button::new("sidebar-add-menu")
-                    .custom(chrome_tile_variant_for(self.selected, cx))
-                    .selected(self.selected)
-                    .icon(Icon::new(IconName::ChevronDown))
-                    .with_size(px(crate::ui::app::TILE_GLYPH / BUTTON_ICON_SCALE))
-                    .w(px(MIN_TARGET))
-                    .h(px(crate::ui::app::TILE_SIZE))
-                    .rounded_corners(segment_corners(1, 2, px(RAIL_TILE_RADIUS), px(0.)))
-                    .accessible_label(t(L10nKey::SidebarNewTabMenu))
-                    .when(!self.selected, |b| b.tooltip(t(L10nKey::SidebarNewTabMenu))),
+                chrome_tile_sized(
+                    Button::new(SharedString::from(format!("{}-menu", self.id)))
+                        .icon(Icon::new(IconName::ChevronDown)),
+                    self.tile,
+                    glyph,
+                    self.selected,
+                    cx,
+                )
+                .w(px(MIN_TARGET))
+                .rounded_corners(half(1))
+                .accessible_label(t(L10nKey::NewTabMoreOptions))
+                // Not while the list it names is already open under it.
+                .when(!self.selected, |b| b.tooltip(t(L10nKey::NewTabMoreOptions))),
             )
     }
 }
 
 impl Tty7App {
-    /// A split button for the sidebar header: the `+` creates a default-shell
-    /// tab immediately, while the chevron opens the full [`NewTabMenu`].
-    pub(crate) fn sidebar_new_tab_split(&self, cx: &Context<Self>) -> impl IntoElement + use<> {
-        let app = cx.entity().downgrade();
-        SidebarNewTabSplit::new("sidebar-new-tab-split", app.clone()).dropdown_menu_with_anchor(
-            gpui::Anchor::TopLeft,
-            move |menu, window, cx| {
-                let Some(this) = app.upgrade() else {
-                    return menu;
-                };
-                this.read(cx)
-                    .new_tab_menu_rows(app.clone(), cx)
-                    .build(menu, window)
-            },
-        )
-    }
-
     /// What the menu offers, read off the app as the menu opens — the builder
     /// runs on the popup's own entity, so the rows carry a weak handle back.
     fn new_tab_menu_rows(&self, app: gpui::WeakEntity<Self>, cx: &App) -> NewTabMenu {
@@ -2487,7 +2472,7 @@ impl Tty7App {
         } else {
             document_w
         };
-        let fixed_w = 3. * CHIP_GAP + crate::ui::app::TILE_SIZE + corner_w;
+        let fixed_w = 3. * CHIP_GAP + NEW_TAB_W + corner_w;
         let chips_avail = (strip_w - px(fixed_w + GRAB_HANDLE_W)).max(px(80.));
         let mut chips = h_flex()
             .items_center()
@@ -4377,29 +4362,5 @@ mod tests {
         let named = menu_agents(&few, &two, now);
         assert_eq!(named, vec![CLIAgent::Claude, CLIAgent::Codex]);
         assert_eq!(named.len(), few.len());
-    }
-
-    #[test]
-    fn sidebar_split_corners_round_outer_edges_only() {
-        let left = segment_corners(0, 2, px(RAIL_TILE_RADIUS), px(0.));
-        assert_eq!(left.top_left, px(RAIL_TILE_RADIUS));
-        assert_eq!(left.bottom_left, px(RAIL_TILE_RADIUS));
-        assert_eq!(left.top_right, px(0.));
-        assert_eq!(left.bottom_right, px(0.));
-
-        let right = segment_corners(1, 2, px(RAIL_TILE_RADIUS), px(0.));
-        assert_eq!(right.top_left, px(0.));
-        assert_eq!(right.bottom_left, px(0.));
-        assert_eq!(right.top_right, px(RAIL_TILE_RADIUS));
-        assert_eq!(right.bottom_right, px(RAIL_TILE_RADIUS));
-    }
-
-    #[test]
-    fn sidebar_new_tab_split_selectable_state() {
-        let app = gpui::WeakEntity::<Tty7App>::new_invalid();
-        let split = SidebarNewTabSplit::new("test-split", app);
-        assert!(!split.is_selected());
-        let selected_split = split.selected(true);
-        assert!(selected_split.is_selected());
     }
 }
