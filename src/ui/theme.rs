@@ -321,11 +321,11 @@ pub(crate) const SYSTEM_MATERIAL_OPACITY: f32 = 0.82;
 /// table is unit-testable on every platform.
 #[cfg(any(target_os = "windows", test))]
 pub(crate) fn windows_background_appearance(
-    _backdrop: WindowBackdrop,
+    backdrop: WindowBackdrop,
     blur: bool,
     build: u32,
 ) -> WindowBackgroundAppearance {
-    match _backdrop {
+    match backdrop {
         WindowBackdrop::Auto => {
             if blur {
                 WindowBackgroundAppearance::Blurred
@@ -430,13 +430,14 @@ pub(crate) fn windows_build_number() -> u32 {
     })
 }
 
+#[cfg_attr(not(target_os = "windows"), allow(unused_variables))]
 pub(crate) fn resolved_background_appearance(
-    _backdrop: WindowBackdrop,
+    backdrop: WindowBackdrop,
     blur: bool,
 ) -> WindowBackgroundAppearance {
     #[cfg(target_os = "windows")]
     {
-        windows_background_appearance(_backdrop, blur, windows_build_number())
+        windows_background_appearance(backdrop, blur, windows_build_number())
     }
     #[cfg(not(target_os = "windows"))]
     {

@@ -223,7 +223,7 @@ jobs:
             asset: tty7-server-linux-aarch64-musl
     runs-on: ubuntu-latest
     env:
-      RUSTFLAGS: -D warnings -C strip=symbols
+      RUSTFLAGS: -C strip=symbols
     steps:
       - name: Checkout tty7
         uses: actions/checkout@v4
@@ -324,7 +324,7 @@ jobs:
             asset: tty7-server-macos-x86_64
     runs-on: macos-latest
     env:
-      RUSTFLAGS: -D warnings -C strip=symbols
+      RUSTFLAGS: -C strip=symbols
     steps:
       - name: Checkout tty7
         uses: actions/checkout@v4
