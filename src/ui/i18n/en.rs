@@ -2247,6 +2247,13 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::TabTooltipHideDetailPanel => "Hide Detail Panel",
         L10nKey::TabTooltipShowDetailPanel => "Show Detail Panel",
         L10nKey::TabTooltipZoomed => "Pane zoomed — other panes hidden",
+        L10nKey::PanelResizeWait => "Wait for the current panel resize to finish.",
+        L10nKey::PanelResizeUnavailable => {
+            "Could not preserve terminal width for this panel change."
+        }
+        L10nKey::PanelPositionUnavailable => {
+            "Could not keep the terminal in the same screen position."
+        }
         L10nKey::TabMenuLocalShells => "Local",
         L10nKey::TabMenuAddHost => "Add SSH Host…",
         L10nKey::TabMenuAllHosts => "All SSH Hosts…",

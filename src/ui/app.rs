@@ -178,6 +178,14 @@ const MAX_CLOSED_TABS: usize = 20;
 const REOPEN_SETTLE_POLLS: u32 = 40;
 const REOPEN_SETTLE_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
+/// Give native window managers two seconds per resize attempt before rolling
+/// the panel state back.
+const PANEL_RESIZE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+/// Allow two pixels for native window-manager rounding.
+const PANEL_RESIZE_BOUNDS_TOLERANCE_PX: f32 = 2.;
+/// Keep resize targets at or above the workspace window's declared minimum.
+const PRESERVE_TERMINAL_MIN_WINDOW_WIDTH: f32 = 720.;
+
 const RESIZE_STEP: f32 = 0.05;
 
 pub(crate) const RECORD_COMMIT_DELAY_MS: u64 = 650;
@@ -1107,6 +1115,9 @@ pub struct Tty7App {
     /// config once, on mouse up.
     pub(crate) document_ratio: Rc<Cell<f32>>,
     pub(crate) document_dragging: Rc<Cell<bool>>,
+    terminal_column_width: Rc<Cell<Option<Pixels>>>,
+    panel_resize_transition: Option<PanelResizeTransition>,
+    panel_resize_generation: u64,
     pub(crate) right_panel_visible: bool,
     pub(crate) right_panel_tab: RightPanelTab,
     pub(crate) sidebar_collapsed: bool,
@@ -1209,6 +1220,90 @@ pub struct Tty7App {
     /// Why the window opened with no terminal in it. Shown on the home screen,
     /// which is otherwise indistinguishable from having closed everything.
     pub(crate) startup_error: Option<gpui::SharedString>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum DockPanel {
+    Left,
+    Right,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum PanelPreference {
+    Left {
+        tab_bar_position: TabBarPosition,
+        sidebar_collapsed: bool,
+    },
+    Right {
+        visible: bool,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum ResizePhase {
+    PreparingOpen,
+    AwaitingTarget,
+    RollingBack,
+}
+
+#[derive(Clone, Copy)]
+struct PanelResizeTransition {
+    generation: u64,
+    panel: DockPanel,
+    panel_width: Pixels,
+    terminal_width: Pixels,
+    original_size: Size<Pixels>,
+    target_width: Pixels,
+    preference_before: PanelPreference,
+    phase: ResizePhase,
+    native_origin_shifted: bool,
+}
+
+fn left_panel_completion_origin_delta(transition: &PanelResizeTransition) -> Option<Pixels> {
+    let closes_left_panel = matches!(transition.panel, DockPanel::Left)
+        && transition.target_width < transition.original_size.width;
+    let restores_opening_origin = matches!(transition.panel, DockPanel::Left)
+        && transition.native_origin_shifted
+        && matches!(transition.phase, ResizePhase::RollingBack);
+    (closes_left_panel || restores_opening_origin).then_some(transition.panel_width)
+}
+
+fn shift_native_window_x(window: &Window, delta: Pixels) -> bool {
+    #[cfg(all(target_os = "macos", not(test)))]
+    {
+        use objc2::rc::Retained;
+        use objc2_app_kit::NSView;
+        use objc2_foundation::NSPoint;
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+        let Ok(handle) = HasWindowHandle::window_handle(window) else {
+            return false;
+        };
+        let RawWindowHandle::AppKit(handle) = handle.as_raw() else {
+            return false;
+        };
+        // SAFETY: The raw AppKit handle guarantees a live NSView for the
+        // WindowHandle's lifetime; retaining it keeps it alive for this call.
+        let Some(view) = (unsafe { Retained::<NSView>::retain(handle.ns_view.as_ptr().cast()) })
+        else {
+            return false;
+        };
+        let Some(native_window) = view.window() else {
+            return false;
+        };
+        let frame = native_window.frame();
+        native_window.setFrameOrigin(NSPoint::new(
+            frame.origin.x + f64::from(delta.as_f32()),
+            frame.origin.y,
+        ));
+        true
+    }
+
+    #[cfg(any(not(target_os = "macos"), test))]
+    {
+        let _ = (window, delta);
+        cfg!(test)
+    }
 }
 
 /// What a raised close question is about. Tabs are named by their id, not their
@@ -1814,6 +1909,9 @@ impl Tty7App {
             right_panel_dragging: Rc::new(Cell::new(false)),
             document_ratio: Rc::new(Cell::new(document_ratio)),
             document_dragging: Rc::new(Cell::new(false)),
+            terminal_column_width: Rc::new(Cell::new(None)),
+            panel_resize_transition: None,
+            panel_resize_generation: 0,
             right_panel_visible,
             right_panel_tab,
             sidebar_collapsed,
@@ -1875,8 +1973,9 @@ impl Tty7App {
         })
         .detach();
 
-        cx.observe_window_bounds(window, |this, window, _cx| {
+        cx.observe_window_bounds(window, |this, window, cx| {
             this.window_bounds = window_bounds_to_remember(window);
+            this.panel_resize_bounds_changed(window, cx);
         })
         .detach();
 
@@ -3805,7 +3904,7 @@ impl Tty7App {
         if ctx.route.is_none() {
             return;
         }
-        self.set_right_panel_tab(crate::core::config::RightPanelTab::Info, cx);
+        self.set_right_panel_tab(crate::core::config::RightPanelTab::Info, window, cx);
         if self.loopback_panel.form_pane_id != Some(ctx.pane_id) {
             self.toggle_managed_forward_form(ctx.pane_id, window, cx);
         }
@@ -4000,33 +4099,291 @@ impl Tty7App {
         self.update_config(cx, |cfg| cfg.confirm_close = mode);
     }
 
-    pub(crate) fn set_tab_bar_position(&mut self, pos: TabBarPosition, cx: &mut Context<Self>) {
+    pub(crate) fn set_tab_bar_position(
+        &mut self,
+        pos: TabBarPosition,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.panel_resize_transition.is_some() {
+            window.push_notification(t(L10nKey::PanelResizeWait), cx);
+            return;
+        }
+        let will_be_open =
+            pos == TabBarPosition::Left && !self.sidebar_collapsed && !self.tabs.is_empty();
+        let is_open = self.left_panel_open(cx);
+        let resize_panel = will_be_open != is_open;
+        if resize_panel
+            && !self.begin_panel_resize_transition(
+                DockPanel::Left,
+                will_be_open,
+                self.sidebar_px(window, cx),
+                PanelPreference::Left {
+                    tab_bar_position: cx.global::<Config>().tab_bar_position,
+                    sidebar_collapsed: self.sidebar_collapsed,
+                },
+                window,
+                cx,
+            )
+        {
+            return;
+        }
         self.update_config(cx, |cfg| cfg.tab_bar_position = pos);
+        if resize_panel {
+            self.request_panel_resize(window, cx);
+        }
+        cx.notify();
     }
 
     pub(crate) fn set_sidebar_auto_grouping(&mut self, on: bool, cx: &mut Context<Self>) {
         self.update_config(cx, |cfg| cfg.sidebar_auto_grouping = on);
     }
 
-    pub(crate) fn toggle_tab_sidebar(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn toggle_tab_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let next = match cx.global::<Config>().tab_bar_position {
             TabBarPosition::Top => TabBarPosition::Left,
             TabBarPosition::Left => TabBarPosition::Top,
         };
-        self.set_tab_bar_position(next, cx);
+        self.set_tab_bar_position(next, window, cx);
     }
 
-    pub(crate) fn toggle_left_panel(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn toggle_left_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.panel_resize_transition.is_some() {
+            window.push_notification(t(L10nKey::PanelResizeWait), cx);
+            return;
+        }
         let (pos, collapsed) = match cx.global::<Config>().tab_bar_position {
             TabBarPosition::Top => (TabBarPosition::Left, false),
             TabBarPosition::Left => (TabBarPosition::Left, !self.sidebar_collapsed),
         };
+        let will_be_open = pos == TabBarPosition::Left && !collapsed && !self.tabs.is_empty();
+        let is_open = self.left_panel_open(cx);
+        let resize_panel = will_be_open != is_open;
+        if resize_panel {
+            let started = self.begin_panel_resize_transition(
+                DockPanel::Left,
+                will_be_open,
+                self.sidebar_px(window, cx),
+                PanelPreference::Left {
+                    tab_bar_position: cx.global::<Config>().tab_bar_position,
+                    sidebar_collapsed: self.sidebar_collapsed,
+                },
+                window,
+                cx,
+            );
+            if !started {
+                return;
+            }
+        }
         self.sidebar_collapsed = collapsed;
         self.update_config(cx, |cfg| {
             cfg.tab_bar_position = pos;
             cfg.sidebar_collapsed = collapsed;
         });
+        if resize_panel {
+            self.request_panel_resize(window, cx);
+        }
         cx.notify();
+    }
+
+    pub(crate) fn begin_panel_resize_transition(
+        &mut self,
+        panel: DockPanel,
+        opening: bool,
+        panel_width: f32,
+        preference_before: PanelPreference,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !cx.global::<Config>().preserve_terminal_width || panel_width <= 0. {
+            return true;
+        }
+        if window.is_fullscreen() || window.is_maximized() {
+            return true;
+        }
+        if self.panel_resize_transition.is_some() {
+            window.push_notification(t(L10nKey::PanelResizeUnavailable), cx);
+            return false;
+        }
+
+        let Some(terminal_width) = self.terminal_column_width.get() else {
+            window.push_notification(t(L10nKey::PanelResizeUnavailable), cx);
+            return false;
+        };
+        let original_size = window.viewport_size();
+        let width_delta = if opening { panel_width } else { -panel_width };
+        let target_width = original_size.width.as_f32() + width_delta;
+        if target_width < PRESERVE_TERMINAL_MIN_WINDOW_WIDTH {
+            window.push_notification(t(L10nKey::PanelResizeUnavailable), cx);
+            return false;
+        }
+
+        self.panel_resize_generation = self.panel_resize_generation.wrapping_add(1);
+        let generation = self.panel_resize_generation;
+        self.panel_resize_transition = Some(PanelResizeTransition {
+            generation,
+            panel,
+            panel_width: px(panel_width),
+            terminal_width,
+            original_size,
+            target_width: px(target_width),
+            preference_before,
+            phase: if matches!(panel, DockPanel::Left) && opening {
+                ResizePhase::PreparingOpen
+            } else {
+                ResizePhase::AwaitingTarget
+            },
+            native_origin_shifted: false,
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            for _ in 0..2 {
+                smol::Timer::after(PANEL_RESIZE_TIMEOUT).await;
+                let _ = this.update_in(cx, |this, window, cx| {
+                    this.panel_resize_timeout(generation, window, cx)
+                });
+            }
+        })
+        .detach();
+        true
+    }
+
+    pub(crate) fn request_panel_resize(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(transition) = self.panel_resize_transition else {
+            return;
+        };
+        if matches!(transition.phase, ResizePhase::PreparingOpen) {
+            let generation = transition.generation;
+            // Let the sidebar render before the native window moves and redraws.
+            cx.on_next_frame(window, move |this, window, cx| {
+                this.start_panel_resize(generation, window, cx);
+            });
+        } else {
+            window.resize(size(
+                transition.target_width,
+                transition.original_size.height,
+            ));
+        }
+    }
+
+    fn start_panel_resize(&mut self, generation: u64, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(mut transition) = self.panel_resize_transition else {
+            return;
+        };
+        if transition.generation != generation
+            || !matches!(transition.phase, ResizePhase::PreparingOpen)
+        {
+            return;
+        }
+
+        transition.native_origin_shifted = shift_native_window_x(window, -transition.panel_width);
+        if !transition.native_origin_shifted {
+            window.push_notification(t(L10nKey::PanelPositionUnavailable), cx);
+        }
+        transition.phase = ResizePhase::AwaitingTarget;
+        self.panel_resize_transition = Some(transition);
+        window.resize(size(
+            transition.target_width,
+            transition.original_size.height,
+        ));
+    }
+
+    pub(crate) fn panel_resize_in_progress(&self) -> bool {
+        self.panel_resize_transition.is_some()
+    }
+
+    pub(crate) fn right_panel_resize_in_progress(&self) -> bool {
+        self.panel_resize_transition
+            .is_some_and(|transition| matches!(transition.panel, DockPanel::Right))
+    }
+
+    fn panel_resize_bounds_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(transition) = self.panel_resize_transition else {
+            return;
+        };
+        if (window.viewport_size().width - transition.target_width).abs()
+            <= px(PANEL_RESIZE_BOUNDS_TOLERANCE_PX)
+        {
+            self.finish_panel_resize_transition(transition, window, cx);
+        }
+    }
+
+    fn finish_panel_resize_transition(
+        &mut self,
+        transition: PanelResizeTransition,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let delta = left_panel_completion_origin_delta(&transition);
+        if delta.is_some_and(|delta| !shift_native_window_x(window, delta)) {
+            window.push_notification(t(L10nKey::PanelPositionUnavailable), cx);
+        }
+        self.panel_resize_transition = None;
+        cx.notify();
+    }
+
+    fn panel_resize_timeout(
+        &mut self,
+        generation: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(mut transition) = self.panel_resize_transition else {
+            return;
+        };
+        if transition.generation != generation {
+            return;
+        }
+
+        if (window.viewport_size().width - transition.target_width).abs()
+            <= px(PANEL_RESIZE_BOUNDS_TOLERANCE_PX)
+        {
+            self.finish_panel_resize_transition(transition, window, cx);
+            return;
+        }
+
+        match transition.phase {
+            ResizePhase::PreparingOpen => {
+                self.restore_panel_preference(transition.preference_before, cx);
+                self.finish_panel_resize_transition(transition, window, cx);
+            }
+            ResizePhase::AwaitingTarget => {
+                self.restore_panel_preference(transition.preference_before, cx);
+                transition.phase = ResizePhase::RollingBack;
+                if (window.viewport_size().width - transition.original_size.width).abs()
+                    <= px(PANEL_RESIZE_BOUNDS_TOLERANCE_PX)
+                {
+                    self.finish_panel_resize_transition(transition, window, cx);
+                } else {
+                    transition.target_width = transition.original_size.width;
+                    self.panel_resize_transition = Some(transition);
+                    window.resize(transition.original_size);
+                }
+                cx.notify();
+            }
+            ResizePhase::RollingBack => {
+                self.finish_panel_resize_transition(transition, window, cx);
+                window.push_notification(t(L10nKey::PanelResizeUnavailable), cx);
+            }
+        }
+    }
+
+    fn restore_panel_preference(&mut self, preference: PanelPreference, cx: &mut Context<Self>) {
+        match preference {
+            PanelPreference::Left {
+                tab_bar_position,
+                sidebar_collapsed,
+            } => {
+                self.sidebar_collapsed = sidebar_collapsed;
+                self.update_config(cx, |cfg| {
+                    cfg.tab_bar_position = tab_bar_position;
+                    cfg.sidebar_collapsed = sidebar_collapsed;
+                });
+            }
+            PanelPreference::Right { visible } => {
+                self.right_panel_visible = visible;
+                self.update_config(cx, |cfg| cfg.right_panel_visible = visible);
+            }
+        }
     }
 
     pub(crate) fn left_panel_open(&self, cx: &gpui::App) -> bool {
@@ -6924,10 +7281,10 @@ impl Tty7App {
             MoveTabRight => self.move_tab(true, cx),
             ToggleMaximizePane => self.toggle_maximize(window, cx),
             ToggleFullscreen => self.toggle_fullscreen(window, cx),
-            ToggleTabSidebar => self.toggle_tab_sidebar(cx),
-            ToggleLeftPanel => self.toggle_left_panel(cx),
-            ToggleRightPanel => self.toggle_right_panel(cx),
-            ShowRightPanel(tab) => self.set_right_panel_tab(tab, cx),
+            ToggleTabSidebar => self.toggle_tab_sidebar(window, cx),
+            ToggleLeftPanel => self.toggle_left_panel(window, cx),
+            ToggleRightPanel => self.toggle_right_panel(window, cx),
+            ShowRightPanel(tab) => self.set_right_panel_tab(tab, window, cx),
             ResetFontSize => self.reset_font_size(cx),
             FindInTerminal => {
                 if let Some(leaf) = self.focused_leaf(window, cx) {
@@ -7246,7 +7603,7 @@ impl Tty7App {
             }
             L10nKey::SettingsConfirmClose => self.set_confirm_close(defaults.confirm_close, cx),
             L10nKey::SettingsTabBarPosition => {
-                self.set_tab_bar_position(defaults.tab_bar_position, cx)
+                self.set_tab_bar_position(defaults.tab_bar_position, window, cx)
             }
             L10nKey::SettingsSidebarGrouping => {
                 self.set_sidebar_auto_grouping(defaults.sidebar_auto_grouping, cx)
@@ -9586,7 +9943,16 @@ impl Render for Tty7App {
         let tab_landing = self.tab_landing(window, cx);
         let detach_caret = self.detach_caret(window, cx);
         let strip = self.tab_strip(!vertical, window, cx);
-        let sidebar = rail.then(|| self.tab_sidebar(window, cx));
+        // Keep the opening sidebar visible; only a closing panel becomes a placeholder.
+        let left_panel_closing = self.panel_resize_transition.is_some_and(|transition| {
+            matches!(transition.panel, DockPanel::Left)
+                && transition.target_width < transition.original_size.width
+        });
+        let sidebar = (rail && !left_panel_closing).then(|| self.tab_sidebar(window, cx));
+        let left_placeholder_width = self
+            .panel_resize_transition
+            .filter(|_| left_panel_closing)
+            .map(|transition| transition.panel_width);
         let ssh_status = self
             .tabs
             .get(self.active)
@@ -9755,12 +10121,17 @@ impl Render for Tty7App {
             .map_or(0., |_| document_dock_px.unwrap_or_default());
 
         let right_panel = self.render_right_panel(window, cx);
+        let right_placeholder_width = self
+            .panel_resize_transition
+            .filter(|transition| matches!(transition.panel, DockPanel::Right))
+            .map(|transition| transition.panel_width);
         // A docked document takes the same fork the right panel does: on
         // Windows and Linux the window controls live at the right end of the
         // title bar, so the bar has to span the workspace rather than sit
         // inside the terminal column with a column drawn to the right of it.
+        let right_panel_reserved = right_panel.is_some() || right_placeholder_width.is_some();
         let panel_below_title_bar =
-            (right_panel.is_some() || document_column.is_some()) && !cfg!(target_os = "macos");
+            (right_panel_reserved || document_column.is_some()) && !cfg!(target_os = "macos");
         let (column_title_bar, spanning_title_bar) = if panel_below_title_bar {
             (None, Some(title_bar))
         } else {
@@ -9774,17 +10145,35 @@ impl Render for Tty7App {
         let panel_px = if right_panel.is_some() {
             self.right_panel_px(window, cx)
         } else {
-            0.
+            right_placeholder_width.map_or(0., Pixels::as_f32)
         };
-        let terminal_column = div()
-            .flex_1()
+        let measured_terminal_width = self.terminal_column_width.clone();
+        let pinned_terminal_width = self
+            .panel_resize_transition
+            .map(|transition| transition.terminal_width);
+        let mut terminal_column = div()
             .min_w_0()
             .flex()
             .flex_col()
             .relative()
             .when_some(column_title_bar, |this, bar| this.child(bar))
             .child(body_area)
+            .child(
+                gpui::canvas(
+                    move |bounds, _window, _cx| {
+                        measured_terminal_width.set(Some(bounds.size.width));
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .inset_0(),
+            )
             .children(column_overlays);
+        if let Some(width) = pinned_terminal_width {
+            terminal_column = terminal_column.w(width).flex_none();
+        } else {
+            terminal_column = terminal_column.flex_1();
+        }
         let panel_row = div()
             .flex_1()
             .min_h_0()
@@ -9793,7 +10182,18 @@ impl Render for Tty7App {
             .flex_row()
             .child(terminal_column)
             .when_some(document_column, |this, column| this.child(column))
-            .when_some(right_panel, |this, panel| this.child(panel));
+            .when_some(right_panel, |this, panel| this.child(panel))
+            .when_some(right_placeholder_width, |this, width| {
+                this.child(
+                    div()
+                        .flex_none()
+                        .w(width)
+                        .h_full()
+                        .bg(crate::ui::theme::workspace_surface_color(cx))
+                        .border_l(crate::ui::theme::hairline(window))
+                        .border_color(cx.theme().sidebar_border),
+                )
+            });
         let main_layout = div()
             .flex_1()
             .min_h_0()
@@ -9801,6 +10201,17 @@ impl Render for Tty7App {
             .flex()
             .flex_row()
             .when_some(sidebar, |this, sidebar| this.child(sidebar))
+            .when_some(left_placeholder_width, |this, width| {
+                this.child(
+                    div()
+                        .flex_none()
+                        .w(width)
+                        .h_full()
+                        .bg(crate::ui::theme::rail_surface_color(cx))
+                        .border_r(crate::ui::theme::hairline(window))
+                        .border_color(cx.theme().sidebar_border),
+                )
+            })
             .child(match spanning_title_bar {
                 Some(bar) => div()
                     .flex_1()
@@ -10080,31 +10491,29 @@ impl Render for Tty7App {
                 .on_action(cx.listener(|this, _: &ToggleFullscreen, window, cx| {
                     this.toggle_fullscreen(window, cx)
                 }))
-                .on_action(cx.listener(|this, _: &ToggleTabSidebar, _window, cx| {
-                    this.toggle_tab_sidebar(cx)
+                .on_action(cx.listener(|this, _: &ToggleTabSidebar, window, cx| {
+                    this.toggle_tab_sidebar(window, cx)
                 }))
-                .on_action(
-                    cx.listener(|this, _: &ToggleLeftPanel, _window, cx| {
-                        this.toggle_left_panel(cx)
-                    }),
-                )
-                .on_action(cx.listener(|this, _: &ToggleRightPanel, _window, cx| {
-                    this.toggle_right_panel(cx)
+                .on_action(cx.listener(|this, _: &ToggleLeftPanel, window, cx| {
+                    this.toggle_left_panel(window, cx)
                 }))
-                .on_action(cx.listener(|this, _: &ShowRightPanelInfo, _window, cx| {
-                    this.set_right_panel_tab(crate::core::config::RightPanelTab::Info, cx)
+                .on_action(cx.listener(|this, _: &ToggleRightPanel, window, cx| {
+                    this.toggle_right_panel(window, cx)
                 }))
-                .on_action(cx.listener(|this, _: &ShowRightPanelChanges, _window, cx| {
-                    this.set_right_panel_tab(crate::core::config::RightPanelTab::Scm, cx)
+                .on_action(cx.listener(|this, _: &ShowRightPanelInfo, window, cx| {
+                    this.set_right_panel_tab(crate::core::config::RightPanelTab::Info, window, cx)
                 }))
-                .on_action(cx.listener(|this, _: &ShowRightPanelFiles, _window, cx| {
-                    this.set_right_panel_tab(crate::core::config::RightPanelTab::Files, cx)
+                .on_action(cx.listener(|this, _: &ShowRightPanelChanges, window, cx| {
+                    this.set_right_panel_tab(crate::core::config::RightPanelTab::Scm, window, cx)
                 }))
-                .on_action(cx.listener(|this, _: &ShowRightPanelSearch, _window, cx| {
-                    this.set_right_panel_tab(crate::core::config::RightPanelTab::Search, cx)
+                .on_action(cx.listener(|this, _: &ShowRightPanelFiles, window, cx| {
+                    this.set_right_panel_tab(crate::core::config::RightPanelTab::Files, window, cx)
                 }))
-                .on_action(cx.listener(|this, _: &ShowRightPanelGitHub, _window, cx| {
-                    this.set_right_panel_tab(crate::core::config::RightPanelTab::GitHub, cx)
+                .on_action(cx.listener(|this, _: &ShowRightPanelSearch, window, cx| {
+                    this.set_right_panel_tab(crate::core::config::RightPanelTab::Search, window, cx)
+                }))
+                .on_action(cx.listener(|this, _: &ShowRightPanelGitHub, window, cx| {
+                    this.set_right_panel_tab(crate::core::config::RightPanelTab::GitHub, window, cx)
                 }))
                 .on_action(
                     cx.listener(|this, _: &ScmToggleGraph, _window, cx| this.scm_toggle_graph(cx)),
@@ -11723,15 +12132,298 @@ mod window_drag_tests {
 mod tests {
     use super::close_reason;
     use super::{
-        CloseReason, DOCUMENT_MIN_W, Dir, OpenedFrom, Pane, Rename, TERMINAL_MIN_W,
-        TITLE_BAR_BORDER, TITLE_BAR_HEIGHT, Tab, TabAgentSession, clear_window_override_values,
-        close_prompt, document_column_px, inherited_start_dir, join_shell_args,
-        leaf_shares_the_window_daemon, mru_order, native_ssh_pane_alive, one_slot_move,
-        pane_free_for, parse_ssh_connect_input, parse_ssh_option_words, rename_outcome,
-        side_panel_max, split_machine_held, split_shell_args, step_in_order, strip_band,
-        title_strip_centre, title_strip_content_centre, title_strip_rule_and_pad, wd_path_saveable,
+        CloseReason, DOCUMENT_MIN_W, Dir, DockPanel, OpenedFrom, Pane, PanelResizeTransition,
+        Rename, ResizePhase, TERMINAL_MIN_W, TITLE_BAR_BORDER, TITLE_BAR_HEIGHT, Tab,
+        TabAgentSession, clear_window_override_values, close_prompt, document_column_px,
+        inherited_start_dir, join_shell_args, leaf_shares_the_window_daemon, mru_order,
+        native_ssh_pane_alive, one_slot_move, pane_free_for, parse_ssh_connect_input,
+        parse_ssh_option_words, rename_outcome, side_panel_max, split_machine_held,
+        split_shell_args, step_in_order, strip_band, title_strip_centre,
+        title_strip_content_centre, title_strip_rule_and_pad, wd_path_saveable,
     };
     use gpui::{Edges, point, px, size};
+
+    #[test]
+    fn left_panel_origin_shift_preserves_position_and_is_reversed_on_rollback() {
+        let closing = PanelResizeTransition {
+            generation: 1,
+            panel: DockPanel::Left,
+            panel_width: px(240.),
+            terminal_width: px(600.),
+            original_size: size(px(1000.), px(700.)),
+            target_width: px(760.),
+            preference_before: super::PanelPreference::Left {
+                tab_bar_position: crate::core::config::TabBarPosition::Left,
+                sidebar_collapsed: false,
+            },
+            phase: ResizePhase::AwaitingTarget,
+            native_origin_shifted: false,
+        };
+        assert_eq!(
+            super::left_panel_completion_origin_delta(&closing),
+            Some(px(240.))
+        );
+
+        let opening = PanelResizeTransition {
+            target_width: px(1240.),
+            native_origin_shifted: true,
+            ..closing
+        };
+        assert_eq!(super::left_panel_completion_origin_delta(&opening), None);
+
+        let rollback = PanelResizeTransition {
+            target_width: closing.original_size.width,
+            phase: ResizePhase::RollingBack,
+            ..opening
+        };
+        assert_eq!(
+            super::left_panel_completion_origin_delta(&rollback),
+            Some(px(240.))
+        );
+    }
+
+    #[gpui::test]
+    fn a_fixed_terminal_column_keeps_its_width_through_intermediate_viewport_sizes(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::{
+            Context, InteractiveElement as _, IntoElement, ParentElement as _, Render, Styled as _,
+            VisualTestContext, Window, div,
+        };
+
+        struct PinnedTransitionLayout;
+
+        impl Render for PinnedTransitionLayout {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .debug_selector(|| "transition-layout".to_string())
+                    .size_full()
+                    .flex()
+                    .flex_row()
+                    .child(
+                        div()
+                            .debug_selector(|| "terminal-column".to_string())
+                            .h_full()
+                            .w(px(600.))
+                            .flex_none(),
+                    )
+                    .child(
+                        div()
+                            .debug_selector(|| "panel-placeholder".to_string())
+                            .h_full()
+                            .w(px(240.))
+                            .flex_none(),
+                    )
+            }
+        }
+
+        let window = cx.add_window(|_, _| PinnedTransitionLayout);
+        window
+            .update(cx, |_, window, _| window.activate_window())
+            .unwrap();
+        let mut visual = VisualTestContext::from_window(window.into(), cx);
+        visual.update(|window, _| window.refresh());
+        visual.run_until_parked();
+
+        for viewport_width in [600., 660., 720., 840., 900.] {
+            visual.simulate_resize(size(px(viewport_width), px(600.)));
+            visual.run_until_parked();
+            let terminal = visual
+                .debug_bounds("terminal-column")
+                .expect("pinned terminal column remains laid out");
+            let placeholder = visual
+                .debug_bounds("panel-placeholder")
+                .expect("panel placeholder remains laid out");
+            assert_eq!(
+                terminal.size.width,
+                px(600.),
+                "terminal width changed at viewport width {viewport_width}"
+            );
+            assert_eq!(
+                placeholder.origin.x,
+                terminal.origin.x + terminal.size.width
+            );
+            assert_eq!(placeholder.size.width, px(240.));
+        }
+    }
+
+    #[gpui::test]
+    fn preserve_terminal_width_keeps_the_live_terminal_column_fixed_across_panel_transitions(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use crate::core::config::{Config, TabBarPosition};
+        use crate::ui::app::test_window;
+
+        let (app, mut visual, _pane_stream) = test_window::harness_with_pane(cx);
+        visual.run_until_parked();
+        visual.update(|_, cx| {
+            let mut config = cx.global::<Config>().clone();
+            config.preserve_terminal_width = true;
+            config.tab_bar_position = TabBarPosition::Left;
+            config.sidebar_collapsed = false;
+            cx.set_global(config);
+        });
+        app.update_in(&mut visual, |app, _, cx| {
+            app.sidebar_collapsed = false;
+            cx.notify();
+        });
+        visual.run_until_parked();
+
+        let terminal_width_before = app
+            .read_with(&visual, |app, _| app.terminal_column_width.get())
+            .expect("the terminal column has been measured");
+        let viewport_before = visual.update(|window, _| window.viewport_size().width);
+
+        app.update_in(&mut visual, |app, window, cx| {
+            app.set_right_panel_tab(crate::core::config::RightPanelTab::Info, window, cx);
+        });
+        let target_width = app
+            .read_with(&visual, |app, _| {
+                app.panel_resize_transition
+                    .map(|transition| transition.target_width)
+            })
+            .expect("the panel resize has a pending target");
+        let viewport_height = visual.update(|window, _| window.viewport_size().height);
+        for fraction in [0.25, 0.5, 0.75] {
+            let intermediate_width = px(viewport_before.as_f32()
+                + (target_width.as_f32() - viewport_before.as_f32()) * fraction);
+            visual.simulate_resize(size(intermediate_width, viewport_height));
+            visual.run_until_parked();
+            let measured_width = app
+                .read_with(&visual, |app, _| app.terminal_column_width.get())
+                .expect("the terminal column remains measured during intermediate resizes");
+            assert_eq!(
+                measured_width, terminal_width_before,
+                "the terminal column stays fixed at resize fraction {fraction}"
+            );
+        }
+        visual.simulate_resize(size(target_width, viewport_height));
+        visual.run_until_parked();
+
+        let terminal_width_after = app
+            .read_with(&visual, |app, _| app.terminal_column_width.get())
+            .expect("the terminal column remains measured");
+        let viewport_after = visual.update(|window, _| window.viewport_size().width);
+        let panel_open = app.read_with(&visual, |app, _| app.right_panel_visible);
+
+        assert!(panel_open, "the requested panel change is applied");
+        assert!(
+            viewport_after > viewport_before,
+            "opening the panel grows the native viewport ({viewport_before:?} -> {viewport_after:?})"
+        );
+        assert_eq!(
+            terminal_width_after, terminal_width_before,
+            "the terminal column does not change width during the transition"
+        );
+
+        app.update_in(&mut visual, |app, window, cx| {
+            app.toggle_right_panel(window, cx);
+        });
+        let target_width = app
+            .read_with(&visual, |app, _| {
+                app.panel_resize_transition
+                    .map(|transition| transition.target_width)
+            })
+            .expect("closing the panel has a pending target");
+        visual.simulate_resize(size(target_width, viewport_height));
+        visual.run_until_parked();
+
+        let terminal_width_after_close = app
+            .read_with(&visual, |app, _| app.terminal_column_width.get())
+            .expect("the terminal column remains measured after closing");
+        let panel_open = app.read_with(&visual, |app, _| app.right_panel_visible);
+        let viewport_after_close = visual.update(|window, _| window.viewport_size().width);
+        assert!(!panel_open, "the requested panel close is applied");
+        assert_eq!(
+            terminal_width_after_close, terminal_width_before,
+            "closing the panel does not change the terminal column width"
+        );
+        assert_eq!(viewport_after_close, viewport_before);
+
+        app.update_in(&mut visual, |app, window, cx| {
+            app.toggle_left_panel(window, cx);
+        });
+        let target_width = app
+            .read_with(&visual, |app, _| {
+                app.panel_resize_transition
+                    .map(|transition| transition.target_width)
+            })
+            .expect("closing the left panel has a pending target");
+        visual.simulate_resize(size(target_width, viewport_height));
+        visual.run_until_parked();
+        let terminal_width_after_left_close = app
+            .read_with(&visual, |app, _| app.terminal_column_width.get())
+            .expect("the terminal column remains measured after closing the left panel");
+        let left_close_finished =
+            app.read_with(&visual, |app, _| app.panel_resize_transition.is_none());
+        assert!(
+            left_close_finished,
+            "left close transition finishes before opening the sidebar again"
+        );
+        assert_eq!(
+            terminal_width_after_left_close, terminal_width_before,
+            "closing the left panel does not change the terminal column width"
+        );
+
+        app.update_in(&mut visual, |app, window, cx| {
+            app.toggle_left_panel(window, cx);
+        });
+        let generation = app
+            .read_with(&visual, |app, _| {
+                app.panel_resize_transition
+                    .map(|transition| transition.generation)
+            })
+            .expect("opening the left panel has a pending transition");
+        visual.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        let sidebar_bounds = visual
+            .debug_bounds("tab-sidebar")
+            .expect("the opening sidebar is present in the rendered frame");
+        assert!(
+            sidebar_bounds.size.width > px(0.) && sidebar_bounds.size.height > px(0.),
+            "the sidebar has visible layout bounds before the native resize: {sidebar_bounds:?}"
+        );
+        let opening_stage = app.read_with(&visual, |app, _| {
+            app.panel_resize_transition
+                .map(|transition| transition.phase)
+        });
+        assert!(
+            matches!(opening_stage, Some(ResizePhase::PreparingOpen)),
+            "the native resize is still pending while the sidebar frame is rendered"
+        );
+        app.update_in(&mut visual, |app, window, cx| {
+            app.start_panel_resize(generation, window, cx);
+        });
+        let resize_started = app.read_with(&visual, |app, _| {
+            app.panel_resize_transition.is_some_and(|transition| {
+                transition.generation == generation
+                    && matches!(transition.phase, ResizePhase::AwaitingTarget)
+            })
+        });
+        assert!(
+            resize_started,
+            "the production resize stage starts only after the sidebar frame is verified"
+        );
+        let target_width = app
+            .read_with(&visual, |app, _| {
+                app.panel_resize_transition
+                    .map(|transition| transition.target_width)
+            })
+            .expect("opening the left panel has a pending target");
+        visual.simulate_resize(size(target_width, viewport_height));
+        visual.run_until_parked();
+        let terminal_width_after_left_open = app
+            .read_with(&visual, |app, _| app.terminal_column_width.get())
+            .expect("the terminal column remains measured after reopening the left panel");
+        let viewport_after_left_open = visual.update(|window, _| window.viewport_size().width);
+        assert_eq!(
+            terminal_width_after_left_open, terminal_width_before,
+            "opening the left panel does not change the terminal column width"
+        );
+        assert_eq!(viewport_after_left_open, viewport_before);
+    }
 
     #[test]
     fn title_bar_buttons_rest_out_of_sight_only_when_asked_to_and_nobody_points() {

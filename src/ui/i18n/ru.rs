@@ -1782,6 +1782,11 @@ pub fn translate_ru(key: L10nKey) -> Option<&'static str> {
         L10nKey::TabTooltipHideDetailPanel => "Скрыть панель сведений",
         L10nKey::TabTooltipShowDetailPanel => "Показать панель сведений",
         L10nKey::TabTooltipZoomed => "Панель развёрнута, остальные скрыты",
+        L10nKey::PanelResizeWait => "Дождитесь завершения изменения размера панели.",
+        L10nKey::PanelResizeUnavailable => {
+            "Не удалось сохранить ширину терминала при изменении панели."
+        }
+        L10nKey::PanelPositionUnavailable => "Не удалось сохранить положение терминала на экране.",
         L10nKey::TabMenuLocalShells => "Локальные",
         L10nKey::TabMenuAddHost => "Добавить SSH-хост…",
         L10nKey::TabMenuAllHosts => "Все SSH-хосты…",

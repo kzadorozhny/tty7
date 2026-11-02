@@ -1775,7 +1775,9 @@ impl Tty7App {
                             "ToggleLeftPanel",
                             cx,
                         ))
-                        .on_click(cx.listener(|this, _, _window, cx| this.toggle_left_panel(cx))),
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.toggle_left_panel(window, cx)),
+                        ),
                     ),
             );
         // The tile inside asks for `w_full`, and a percentage is only a width
@@ -1912,6 +1914,7 @@ impl Tty7App {
 
         div()
             .relative()
+            .debug_selector(|| "tab-sidebar".to_string())
             .flex_shrink_0()
             .w(px(width))
             .h_full()

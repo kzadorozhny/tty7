@@ -504,14 +504,42 @@ impl Tty7App {
         )
     }
 
-    pub(crate) fn toggle_right_panel(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn toggle_right_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.panel_resize_in_progress() {
+            window.push_notification(t(L10nKey::PanelResizeWait), cx);
+            return;
+        }
         let next = !self.right_panel_visible;
+        let will_be_open = next && !self.tabs.is_empty();
+        let is_open = self.right_panel_open(cx);
+        let resize_panel = will_be_open != is_open;
+        if resize_panel && !self.begin_right_panel_resize_transition(will_be_open, window, cx) {
+            return;
+        }
         self.right_panel_visible = next;
         self.update_config(cx, |cfg| cfg.right_panel_visible = next);
+        if resize_panel {
+            self.request_panel_resize(window, cx);
+        }
         cx.notify();
     }
 
-    pub(crate) fn set_right_panel_tab(&mut self, tab: RightPanelTab, cx: &mut Context<Self>) {
+    pub(crate) fn set_right_panel_tab(
+        &mut self,
+        tab: RightPanelTab,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.panel_resize_in_progress() {
+            window.push_notification(t(L10nKey::PanelResizeWait), cx);
+            return;
+        }
+        let resize_panel = !self.right_panel_open(cx) && !self.tabs.is_empty();
+        if resize_panel {
+            if !self.begin_right_panel_resize_transition(true, window, cx) {
+                return;
+            }
+        }
         // Every way to find in files ends here, and none of them has a
         // `Window` to move focus with; the Files field takes it on its next
         // frame.
@@ -525,7 +553,28 @@ impl Tty7App {
             cfg.right_panel_tab = tab;
             cfg.right_panel_visible = true;
         });
+        if resize_panel {
+            self.request_panel_resize(window, cx);
+        }
         cx.notify();
+    }
+
+    pub(crate) fn begin_right_panel_resize_transition(
+        &mut self,
+        opening: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.begin_panel_resize_transition(
+            super::app::DockPanel::Right,
+            opening,
+            self.right_panel_px(window, cx),
+            super::app::PanelPreference::Right {
+                visible: self.right_panel_visible,
+            },
+            window,
+            cx,
+        )
     }
 
     pub(crate) fn render_right_panel(
@@ -533,6 +582,9 @@ impl Tty7App {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
+        if self.right_panel_resize_in_progress() {
+            return None;
+        }
         let panel_open = self.right_panel_open(cx);
         if let Some(open) = self.sftp_panel.open_pane_id
             && (!panel_open || self.remote_files_pane(window, cx).map(|(id, _)| id) != Some(open))

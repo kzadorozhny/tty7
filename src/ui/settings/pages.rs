@@ -1444,13 +1444,14 @@ impl Tty7App {
             &[t(L10nKey::SettingsTop), t(L10nKey::SettingsLeft)],
             tab_bar_idx,
             cx,
-            |this, ix, _w, cx| {
+            |this, ix, window, cx| {
                 this.set_tab_bar_position(
                     if ix == 0 {
                         TabBarPosition::Top
                     } else {
                         TabBarPosition::Left
                     },
+                    window,
                     cx,
                 );
             },
