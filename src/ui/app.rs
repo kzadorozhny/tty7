@@ -1268,27 +1268,71 @@ fn left_panel_completion_origin_delta(transition: &PanelResizeTransition) -> Opt
     (closes_left_panel || restores_opening_origin).then_some(transition.panel_width)
 }
 
-fn shift_native_window_x(window: &Window, delta: Pixels) -> bool {
-    #[cfg(all(target_os = "macos", not(test)))]
-    {
+/// The AppKit window behind a gpui [`Window`], kept so its frame can change
+/// outside a gpui window update. `setFrame:` calls back into gpui's resize and
+/// draw handlers synchronously, and those update the window, which an update
+/// already in progress holds.
+#[cfg(all(target_os = "macos", not(test)))]
+struct NativeWindow(objc2::rc::Retained<objc2_app_kit::NSWindow>);
+
+#[cfg(all(target_os = "macos", not(test)))]
+impl NativeWindow {
+    fn of(window: &Window) -> Option<Self> {
         use objc2::rc::Retained;
         use objc2_app_kit::NSView;
-        use objc2_foundation::NSPoint;
         use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
-        let Ok(handle) = HasWindowHandle::window_handle(window) else {
-            return false;
-        };
+        let handle = HasWindowHandle::window_handle(window).ok()?;
         let RawWindowHandle::AppKit(handle) = handle.as_raw() else {
-            return false;
+            return None;
         };
         // SAFETY: The raw AppKit handle guarantees a live NSView for the
         // WindowHandle's lifetime; retaining it keeps it alive for this call.
-        let Some(view) = (unsafe { Retained::<NSView>::retain(handle.ns_view.as_ptr().cast()) })
-        else {
-            return false;
-        };
-        let Some(native_window) = view.window() else {
+        let view = unsafe { Retained::<NSView>::retain(handle.ns_view.as_ptr().cast()) }?;
+        view.window().map(Self)
+    }
+
+    /// Moves the window's left edge by `shift` and sets its content width in
+    /// one frame change, so the window never shows the new origin at the old
+    /// width. The frame that draws for the change is the one the app state
+    /// describes when this runs.
+    fn set_content_width(&self, shift: Pixels, content_width: Pixels) {
+        use objc2_foundation::{NSPoint, NSRect, NSSize};
+
+        let frame = self.0.frame();
+        let current_content_width = self.0.contentRectForFrameRect(frame).size.width;
+        let grow = f64::from(content_width.as_f32()) - current_content_width;
+        self.0.setFrame_display_animate(
+            NSRect::new(
+                NSPoint::new(frame.origin.x + f64::from(shift.as_f32()), frame.origin.y),
+                NSSize::new(frame.size.width + grow, frame.size.height),
+            ),
+            true,
+            false,
+        );
+    }
+}
+
+/// Without a native window handle the origin cannot move and the resize goes
+/// through gpui alone.
+#[cfg(any(not(target_os = "macos"), test))]
+struct NativeWindow;
+
+#[cfg(any(not(target_os = "macos"), test))]
+impl NativeWindow {
+    fn of(_: &Window) -> Option<Self> {
+        None
+    }
+
+    fn set_content_width(&self, _: Pixels, _: Pixels) {}
+}
+
+fn shift_native_window_x(window: &Window, delta: Pixels) -> bool {
+    #[cfg(all(target_os = "macos", not(test)))]
+    {
+        use objc2_foundation::NSPoint;
+
+        let Some(NativeWindow(native_window)) = NativeWindow::of(window) else {
             return false;
         };
         let frame = native_window.frame();
@@ -4253,10 +4297,23 @@ impl Tty7App {
         };
         if matches!(transition.phase, ResizePhase::PreparingOpen) {
             let generation = transition.generation;
-            // Let the sidebar render before the native window moves and redraws.
-            cx.on_next_frame(window, move |this, window, cx| {
-                this.start_panel_resize(generation, window, cx);
-            });
+            let (panel_width, target_width) = (transition.panel_width, transition.target_width);
+            // The layout switches to the window's target shape and the window
+            // changes shape in one task poll, so no frame is presented with
+            // one and not the other. The native change runs outside the
+            // window update that switched the layout.
+            cx.spawn_in(window, async move |this, cx| {
+                let native = this
+                    .update_in(cx, |this, window, cx| {
+                        this.start_panel_resize(generation, window, cx)
+                    })
+                    .ok()
+                    .flatten();
+                if let Some(native) = native {
+                    native.set_content_width(-panel_width, target_width);
+                }
+            })
+            .detach();
         } else {
             window.resize(size(
                 transition.target_width,
@@ -4265,26 +4322,36 @@ impl Tty7App {
         }
     }
 
-    fn start_panel_resize(&mut self, generation: u64, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(mut transition) = self.panel_resize_transition else {
-            return;
-        };
+    /// Switches an opening left panel from its prepared layout to the one for
+    /// the target window size. Returns the native window when the caller
+    /// should move and resize it; otherwise the resize has been requested
+    /// through gpui here.
+    fn start_panel_resize(
+        &mut self,
+        generation: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<NativeWindow> {
+        let mut transition = self.panel_resize_transition?;
         if transition.generation != generation
             || !matches!(transition.phase, ResizePhase::PreparingOpen)
         {
-            return;
+            return None;
         }
 
-        transition.native_origin_shifted = shift_native_window_x(window, -transition.panel_width);
-        if !transition.native_origin_shifted {
-            window.push_notification(t(L10nKey::PanelPositionUnavailable), cx);
-        }
+        let native = NativeWindow::of(window);
+        transition.native_origin_shifted = native.is_some();
         transition.phase = ResizePhase::AwaitingTarget;
         self.panel_resize_transition = Some(transition);
-        window.resize(size(
-            transition.target_width,
-            transition.original_size.height,
-        ));
+        cx.notify();
+        if native.is_none() {
+            window.push_notification(t(L10nKey::PanelPositionUnavailable), cx);
+            window.resize(size(
+                transition.target_width,
+                transition.original_size.height,
+            ));
+        }
+        native
     }
 
     pub(crate) fn panel_resize_in_progress(&self) -> bool {
@@ -9943,15 +10010,22 @@ impl Render for Tty7App {
         let tab_landing = self.tab_landing(window, cx);
         let detach_caret = self.detach_caret(window, cx);
         let strip = self.tab_strip(!vertical, window, cx);
-        // Keep the opening sidebar visible; only a closing panel becomes a placeholder.
-        let left_panel_closing = self.panel_resize_transition.is_some_and(|transition| {
-            matches!(transition.panel, DockPanel::Left)
-                && transition.target_width < transition.original_size.width
-        });
-        let sidebar = (rail && !left_panel_closing).then(|| self.tab_sidebar(window, cx));
+        // A left panel in transition is drawn as the placeholder once the
+        // window is on its way to the target size, and its content appears when
+        // the target is reached. Before an opening window has moved, the slot
+        // stays empty: the frame on screen must look as it did before the toggle.
+        let left_phase = self
+            .panel_resize_transition
+            .filter(|transition| matches!(transition.panel, DockPanel::Left))
+            .map(|transition| transition.phase);
+        let left_panel_pending = matches!(
+            left_phase,
+            Some(ResizePhase::PreparingOpen | ResizePhase::AwaitingTarget)
+        );
+        let sidebar = (rail && !left_panel_pending).then(|| self.tab_sidebar(window, cx));
         let left_placeholder_width = self
             .panel_resize_transition
-            .filter(|_| left_panel_closing)
+            .filter(|_| matches!(left_phase, Some(ResizePhase::AwaitingTarget)))
             .map(|transition| transition.panel_width);
         let ssh_status = self
             .tabs
@@ -10204,6 +10278,7 @@ impl Render for Tty7App {
             .when_some(left_placeholder_width, |this, width| {
                 this.child(
                     div()
+                        .debug_selector(|| "left-panel-placeholder".to_string())
                         .flex_none()
                         .w(width)
                         .h_full()
@@ -12368,43 +12443,52 @@ mod tests {
         app.update_in(&mut visual, |app, window, cx| {
             app.toggle_left_panel(window, cx);
         });
-        let generation = app
-            .read_with(&visual, |app, _| {
-                app.panel_resize_transition
-                    .map(|transition| transition.generation)
-            })
-            .expect("opening the left panel has a pending transition");
-        visual.update(|window, cx| {
-            window.refresh();
-            window.draw(cx).clear();
-        });
-        let sidebar_bounds = visual
-            .debug_bounds("tab-sidebar")
-            .expect("the opening sidebar is present in the rendered frame");
-        assert!(
-            sidebar_bounds.size.width > px(0.) && sidebar_bounds.size.height > px(0.),
-            "the sidebar has visible layout bounds before the native resize: {sidebar_bounds:?}"
-        );
         let opening_stage = app.read_with(&visual, |app, _| {
             app.panel_resize_transition
                 .map(|transition| transition.phase)
         });
         assert!(
             matches!(opening_stage, Some(ResizePhase::PreparingOpen)),
-            "the native resize is still pending while the sidebar frame is rendered"
+            "opening the left panel prepares before any native change"
         );
-        app.update_in(&mut visual, |app, window, cx| {
-            app.start_panel_resize(generation, window, cx);
+        visual.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
         });
+        assert!(
+            visual.debug_bounds("tab-sidebar").is_none()
+                && visual.debug_bounds("left-panel-placeholder").is_none(),
+            "the prepared frame leaves the sidebar slot empty, as it was before the toggle"
+        );
+
+        // The layout switch and the native resize request run in one task.
+        visual.run_until_parked();
         let resize_started = app.read_with(&visual, |app, _| {
-            app.panel_resize_transition.is_some_and(|transition| {
-                transition.generation == generation
-                    && matches!(transition.phase, ResizePhase::AwaitingTarget)
-            })
+            app.panel_resize_transition
+                .is_some_and(|transition| matches!(transition.phase, ResizePhase::AwaitingTarget))
         });
         assert!(
             resize_started,
-            "the production resize stage starts only after the sidebar frame is verified"
+            "the resize stage starts once the prepared frame is up"
+        );
+        visual.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        let placeholder = visual
+            .debug_bounds("left-panel-placeholder")
+            .expect("a placeholder holds the sidebar's slot while the window resizes");
+        assert!(
+            visual.debug_bounds("tab-sidebar").is_none(),
+            "the sidebar's content waits for the target size"
+        );
+        assert_eq!(
+            placeholder.size.width,
+            app.read_with(&visual, |app, _| app
+                .panel_resize_transition
+                .map(|transition| transition.panel_width))
+                .expect("the transition is pending"),
+            "the placeholder is as wide as the sidebar it stands in for"
         );
         let target_width = app
             .read_with(&visual, |app, _| {
@@ -12423,6 +12507,15 @@ mod tests {
             "opening the left panel does not change the terminal column width"
         );
         assert_eq!(viewport_after_left_open, viewport_before);
+        visual.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        assert!(
+            visual.debug_bounds("tab-sidebar").is_some()
+                && visual.debug_bounds("left-panel-placeholder").is_none(),
+            "the sidebar replaces its placeholder once the target size is reached"
+        );
     }
 
     #[test]
