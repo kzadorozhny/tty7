@@ -736,6 +736,10 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
         L10nKey::SettingsStartupWindowDesc => "tty7 起動時のウィンドウ状態",
         L10nKey::SettingsRememberWindowSize => "ウィンドウサイズと位置を記憶",
         L10nKey::SettingsRememberWindowSizeDesc => "前回終了時のサイズと位置でウィンドウを開きます",
+        L10nKey::SettingsPreserveTerminalWidth => "サイドパネルを開くときにターミナル幅を維持",
+        L10nKey::SettingsPreserveTerminalWidthDesc => {
+            "サイドパネルを開くとき、ターミナルを狭めずにウィンドウサイズを変更します。"
+        }
         L10nKey::SettingsRestoreLastLayout => "前回のレイアウトを復元",
         L10nKey::SettingsRestoreLastLayoutDesc => {
             "起動時に前回のタブ、分割、ディレクトリを復元します"

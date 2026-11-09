@@ -782,6 +782,12 @@ pub fn translate_ru(key: L10nKey) -> Option<&'static str> {
         L10nKey::SettingsRememberWindowSizeDesc => {
             "Открывать окно там, где оно было при последнем выходе из tty7."
         }
+        L10nKey::SettingsPreserveTerminalWidth => {
+            "Сохранять ширину терминала при открытии боковых панелей"
+        }
+        L10nKey::SettingsPreserveTerminalWidthDesc => {
+            "Изменять размер окна вместо сужения терминала при открытии боковых панелей."
+        }
         L10nKey::SettingsRestoreLastLayout => "Восстанавливать расположение",
         L10nKey::SettingsRestoreLastLayoutDesc => {
             "Открывать вкладки, панели и папки прошлого сеанса."

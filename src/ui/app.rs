@@ -1222,7 +1222,7 @@ pub struct Tty7App {
     pub(crate) startup_error: Option<gpui::SharedString>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum DockPanel {
     Left,
     Right,
@@ -1239,9 +1239,10 @@ pub(crate) enum PanelPreference {
     },
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum ResizePhase {
     PreparingOpen,
+    PreparingClose,
     AwaitingTarget,
     RollingBack,
 }
@@ -1256,16 +1257,31 @@ struct PanelResizeTransition {
     target_width: Pixels,
     preference_before: PanelPreference,
     phase: ResizePhase,
-    native_origin_shifted: bool,
+    native_origin_delta: Option<Pixels>,
 }
 
 fn left_panel_completion_origin_delta(transition: &PanelResizeTransition) -> Option<Pixels> {
-    let closes_left_panel = matches!(transition.panel, DockPanel::Left)
-        && transition.target_width < transition.original_size.width;
-    let restores_opening_origin = matches!(transition.panel, DockPanel::Left)
-        && transition.native_origin_shifted
-        && matches!(transition.phase, ResizePhase::RollingBack);
-    (closes_left_panel || restores_opening_origin).then_some(transition.panel_width)
+    if matches!(transition.phase, ResizePhase::RollingBack) {
+        transition.native_origin_delta.map(|delta| -delta)
+    } else {
+        None
+    }
+}
+
+fn left_panel_native_resize_shift(transition: &PanelResizeTransition) -> Option<Pixels> {
+    if matches!(transition.phase, ResizePhase::PreparingOpen) {
+        Some(-transition.panel_width)
+    } else if matches!(transition.panel, DockPanel::Left)
+        && matches!(transition.phase, ResizePhase::PreparingClose)
+    {
+        Some(transition.panel_width)
+    } else if matches!(transition.panel, DockPanel::Left)
+        && transition.target_width < transition.original_size.width
+    {
+        Some(transition.panel_width)
+    } else {
+        None
+    }
 }
 
 /// The AppKit window behind a gpui [`Window`], kept so its frame can change
@@ -1289,7 +1305,19 @@ impl NativeWindow {
         // SAFETY: The raw AppKit handle guarantees a live NSView for the
         // WindowHandle's lifetime; retaining it keeps it alive for this call.
         let view = unsafe { Retained::<NSView>::retain(handle.ns_view.as_ptr().cast()) }?;
-        view.window().map(Self)
+        let native_window = view.window()?;
+        let frame = native_window.frame();
+        let content_width = native_window.contentRectForFrameRect(frame).size.width;
+        log::info!(
+            "panel native window mapping; gpui_window={:?} native_window={:p} frame_origin=({}, {}) frame_size=({}, {}) content_width={content_width}",
+            window.window_handle().window_id(),
+            std::ptr::from_ref(&*native_window),
+            frame.origin.x,
+            frame.origin.y,
+            frame.size.width,
+            frame.size.height
+        );
+        Some(Self(native_window))
     }
 
     /// Moves the window's left edge by `shift` and sets its content width in
@@ -1302,14 +1330,43 @@ impl NativeWindow {
         let frame = self.0.frame();
         let current_content_width = self.0.contentRectForFrameRect(frame).size.width;
         let grow = f64::from(content_width.as_f32()) - current_content_width;
+        let target_frame_width = frame.size.width + grow;
+        log::info!(
+            "native panel resize before; native_window={:p} frame_origin=({}, {}) frame_width={} content_width={} target_content_width={} target_frame_width={target_frame_width}",
+            std::ptr::from_ref(&*self.0),
+            frame.origin.x,
+            frame.origin.y,
+            frame.size.width,
+            current_content_width,
+            content_width
+        );
         self.0.setFrame_display_animate(
             NSRect::new(
                 NSPoint::new(frame.origin.x + f64::from(shift.as_f32()), frame.origin.y),
-                NSSize::new(frame.size.width + grow, frame.size.height),
+                NSSize::new(target_frame_width, frame.size.height),
             ),
             true,
             false,
         );
+        let frame_after = self.0.frame();
+        let content_width_after = self.0.contentRectForFrameRect(frame_after).size.width;
+        log::info!(
+            "native panel resize after call; native_window={:p} frame_origin=({}, {}) frame_width={} content_width={content_width_after}",
+            std::ptr::from_ref(&*self.0),
+            frame_after.origin.x,
+            frame_after.origin.y,
+            frame_after.size.width
+        );
+    }
+
+    fn shift_x(&self, delta: Pixels) {
+        use objc2_foundation::NSPoint;
+
+        let frame = self.0.frame();
+        self.0.setFrameOrigin(NSPoint::new(
+            frame.origin.x + f64::from(delta.as_f32()),
+            frame.origin.y,
+        ));
     }
 }
 
@@ -1325,29 +1382,8 @@ impl NativeWindow {
     }
 
     fn set_content_width(&self, _: Pixels, _: Pixels) {}
-}
 
-fn shift_native_window_x(window: &Window, delta: Pixels) -> bool {
-    #[cfg(all(target_os = "macos", not(test)))]
-    {
-        use objc2_foundation::NSPoint;
-
-        let Some(NativeWindow(native_window)) = NativeWindow::of(window) else {
-            return false;
-        };
-        let frame = native_window.frame();
-        native_window.setFrameOrigin(NSPoint::new(
-            frame.origin.x + f64::from(delta.as_f32()),
-            frame.origin.y,
-        ));
-        true
-    }
-
-    #[cfg(any(not(target_os = "macos"), test))]
-    {
-        let _ = (window, delta);
-        cfg!(test)
-    }
+    fn shift_x(&self, _: Pixels) {}
 }
 
 /// What a raised close question is about. Tabs are named by their id, not their
@@ -4149,6 +4185,23 @@ impl Tty7App {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if cx.global::<Config>().preserve_terminal_width
+            && let Some((settings_window, workspace_window)) = self.settings_window
+            && settings_window == window.window_handle().into()
+        {
+            let app = cx.entity();
+            cx.defer(move |cx| {
+                if let Err(error) = workspace_window.update(cx, |_, window, cx| {
+                    app.update(cx, |this, cx| this.set_tab_bar_position(pos, window, cx))
+                }) {
+                    log::warn!(
+                        "failed to resize the workspace window for the tab bar change: {error}"
+                    );
+                }
+            });
+            return;
+        }
+
         if self.panel_resize_transition.is_some() {
             window.push_notification(t(L10nKey::PanelResizeWait), cx);
             return;
@@ -4176,7 +4229,11 @@ impl Tty7App {
         if resize_panel {
             self.request_panel_resize(window, cx);
         }
-        cx.notify();
+        if resize_panel && self.panel_resize_transition.is_some() {
+            window.refresh();
+        } else {
+            cx.notify();
+        }
     }
 
     pub(crate) fn set_sidebar_auto_grouping(&mut self, on: bool, cx: &mut Context<Self>) {
@@ -4192,7 +4249,14 @@ impl Tty7App {
     }
 
     pub(crate) fn toggle_left_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.panel_resize_transition.is_some() {
+        if let Some(transition) = self.panel_resize_transition {
+            log::warn!(
+                "left panel toggle ignored during resize; generation={} phase={:?} width={:?} target={:?}",
+                transition.generation,
+                transition.phase,
+                window.viewport_size().width,
+                transition.target_width
+            );
             window.push_notification(t(L10nKey::PanelResizeWait), cx);
             return;
         }
@@ -4227,7 +4291,11 @@ impl Tty7App {
         if resize_panel {
             self.request_panel_resize(window, cx);
         }
-        cx.notify();
+        if resize_panel && self.panel_resize_transition.is_some() {
+            window.refresh();
+        } else {
+            cx.notify();
+        }
     }
 
     pub(crate) fn begin_panel_resize_transition(
@@ -4264,6 +4332,16 @@ impl Tty7App {
 
         self.panel_resize_generation = self.panel_resize_generation.wrapping_add(1);
         let generation = self.panel_resize_generation;
+        let phase = match (panel, opening) {
+            (DockPanel::Left, true) => ResizePhase::PreparingOpen,
+            (DockPanel::Left, false) => ResizePhase::PreparingClose,
+            (DockPanel::Right, _) => ResizePhase::AwaitingTarget,
+        };
+        log::info!(
+            "panel resize started; generation={generation} gpui_window={:?} panel={panel:?} opening={opening} width={:?} panel_width={panel_width:?} target_width={target_width:?} phase={phase:?}",
+            window.window_handle().window_id(),
+            original_size.width,
+        );
         self.panel_resize_transition = Some(PanelResizeTransition {
             generation,
             panel,
@@ -4272,19 +4350,25 @@ impl Tty7App {
             original_size,
             target_width: px(target_width),
             preference_before,
-            phase: if matches!(panel, DockPanel::Left) && opening {
-                ResizePhase::PreparingOpen
-            } else {
-                ResizePhase::AwaitingTarget
-            },
-            native_origin_shifted: false,
+            phase,
+            native_origin_delta: None,
         });
         cx.spawn_in(window, async move |this, cx| {
             for _ in 0..2 {
                 smol::Timer::after(PANEL_RESIZE_TIMEOUT).await;
-                let _ = this.update_in(cx, |this, window, cx| {
-                    this.panel_resize_timeout(generation, window, cx)
-                });
+                let result = cx
+                    .update(|window, cx| {
+                        this.update(cx, |this, cx| {
+                            this.panel_resize_timeout(generation, window, cx);
+                        })
+                    })
+                    .and_then(|result| result);
+                if let Err(error) = result {
+                    log::warn!(
+                        "failed to check panel resize in its originating window; generation={generation}: {error}"
+                    );
+                    break;
+                }
             }
         })
         .detach();
@@ -4295,7 +4379,7 @@ impl Tty7App {
         let Some(transition) = self.panel_resize_transition else {
             return;
         };
-        if matches!(transition.phase, ResizePhase::PreparingOpen) {
+        if let Some(native_shift) = left_panel_native_resize_shift(&transition) {
             let generation = transition.generation;
             let (panel_width, target_width) = (transition.panel_width, transition.target_width);
             // The layout switches to the window's target shape and the window
@@ -4303,14 +4387,51 @@ impl Tty7App {
             // one and not the other. The native change runs outside the
             // window update that switched the layout.
             cx.spawn_in(window, async move |this, cx| {
-                let native = this
-                    .update_in(cx, |this, window, cx| {
-                        this.start_panel_resize(generation, window, cx)
+                let native = match cx
+                    .update(|window, cx| {
+                        this.update(cx, |this, cx| {
+                            this.start_panel_resize(generation, native_shift, window, cx)
+                        })
                     })
-                    .ok()
-                    .flatten();
+                    .and_then(|result| result)
+                {
+                    Ok(native) => native,
+                    Err(error) => {
+                        log::warn!(
+                            "failed to start panel resize in its originating window; generation={generation}: {error}"
+                        );
+                        return;
+                    }
+                };
                 if let Some(native) = native {
-                    native.set_content_width(-panel_width, target_width);
+                    log::info!(
+                        "panel resize applying native frame; generation={generation} panel_width={panel_width:?} target_width={target_width:?}"
+                    );
+                    native.set_content_width(native_shift, target_width);
+                    let settings_window = cx
+                        .update(|_, cx| {
+                            this.update(cx, |this, _| {
+                                this.settings_window.map(|(settings_window, _)| settings_window)
+                            })
+                        })
+                        .and_then(|result| result);
+                    match settings_window {
+                        Ok(Some(settings_window)) => {
+                            if let Err(error) =
+                                settings_window.update(cx, |_, window, _| window.refresh())
+                            {
+                                log::warn!(
+                                    "failed to refresh the settings window after native panel resize; generation={generation}: {error}"
+                                );
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            log::warn!(
+                                "failed to access the settings window after native panel resize; generation={generation}: {error}"
+                            );
+                        }
+                    }
                 }
             })
             .detach();
@@ -4322,28 +4443,26 @@ impl Tty7App {
         }
     }
 
-    /// Switches an opening left panel from its prepared layout to the one for
-    /// the target window size. Returns the native window when the caller
-    /// should move and resize it; otherwise the resize has been requested
-    /// through gpui here.
+    /// Prepares a left-panel resize and returns its native window when available.
     fn start_panel_resize(
         &mut self,
         generation: u64,
+        native_shift: Pixels,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<NativeWindow> {
         let mut transition = self.panel_resize_transition?;
         if transition.generation != generation
-            || !matches!(transition.phase, ResizePhase::PreparingOpen)
+            || left_panel_native_resize_shift(&transition) != Some(native_shift)
         {
             return None;
         }
 
         let native = NativeWindow::of(window);
-        transition.native_origin_shifted = native.is_some();
+        transition.native_origin_delta = native.as_ref().map(|_| native_shift);
         transition.phase = ResizePhase::AwaitingTarget;
         self.panel_resize_transition = Some(transition);
-        cx.notify();
+        window.refresh();
         if native.is_none() {
             window.push_notification(t(L10nKey::PanelPositionUnavailable), cx);
             window.resize(size(
@@ -4367,9 +4486,27 @@ impl Tty7App {
         let Some(transition) = self.panel_resize_transition else {
             return;
         };
+        let _native_window = NativeWindow::of(window);
+        log::info!(
+            "panel resize bounds event; generation={} gpui_window={:?} panel={:?} phase={:?} width={:?} target={:?}",
+            transition.generation,
+            window.window_handle().window_id(),
+            transition.panel,
+            transition.phase,
+            window.viewport_size().width,
+            transition.target_width
+        );
         if (window.viewport_size().width - transition.target_width).abs()
             <= px(PANEL_RESIZE_BOUNDS_TOLERANCE_PX)
         {
+            log::info!(
+                "panel resize target observed; generation={} panel={:?} phase={:?} width={:?} target={:?}",
+                transition.generation,
+                transition.panel,
+                transition.phase,
+                window.viewport_size().width,
+                transition.target_width
+            );
             self.finish_panel_resize_transition(transition, window, cx);
         }
     }
@@ -4381,11 +4518,47 @@ impl Tty7App {
         cx: &mut Context<Self>,
     ) {
         let delta = left_panel_completion_origin_delta(&transition);
-        if delta.is_some_and(|delta| !shift_native_window_x(window, delta)) {
-            window.push_notification(t(L10nKey::PanelPositionUnavailable), cx);
-        }
+        log::info!(
+            "panel resize finishing; generation={} panel={:?} phase={:?} width={:?} origin_delta={delta:?}",
+            transition.generation,
+            transition.panel,
+            transition.phase,
+            window.viewport_size().width
+        );
         self.panel_resize_transition = None;
-        cx.notify();
+        window.refresh();
+        let Some(delta) = delta else {
+            return;
+        };
+        let generation = transition.generation;
+        cx.spawn_in(window, async move |this, cx| {
+            let native_window = match cx
+                .update(|window, cx| {
+                    this.update(cx, |_, cx| {
+                        let native_window = NativeWindow::of(window);
+                        if native_window.is_none() && !cfg!(test) {
+                            window.push_notification(t(L10nKey::PanelPositionUnavailable), cx);
+                        }
+                        native_window
+                    })
+                })
+                .and_then(|result| result)
+            {
+                Ok(native_window) => native_window,
+                Err(error) => {
+                    log::warn!("failed to access the window to restore its position: {error}");
+                    return;
+                }
+            };
+            if let Some(native_window) = native_window {
+                // AppKit move notifications can re-enter GPUI, so move after the window update.
+                log::info!(
+                    "panel resize restoring window origin; generation={generation} delta={delta:?}"
+                );
+                native_window.shift_x(delta);
+            }
+        })
+        .detach();
     }
 
     fn panel_resize_timeout(
@@ -4408,8 +4581,17 @@ impl Tty7App {
             return;
         }
 
+        log::warn!(
+            "panel resize target timed out; generation={} panel={:?} phase={:?} width={:?} target={:?} original={:?}",
+            transition.generation,
+            transition.panel,
+            transition.phase,
+            window.viewport_size().width,
+            transition.target_width,
+            transition.original_size.width
+        );
         match transition.phase {
-            ResizePhase::PreparingOpen => {
+            ResizePhase::PreparingOpen | ResizePhase::PreparingClose => {
                 self.restore_panel_preference(transition.preference_before, cx);
                 self.finish_panel_resize_transition(transition, window, cx);
             }
@@ -4425,7 +4607,7 @@ impl Tty7App {
                     self.panel_resize_transition = Some(transition);
                     window.resize(transition.original_size);
                 }
-                cx.notify();
+                window.refresh();
             }
             ResizePhase::RollingBack => {
                 self.finish_panel_resize_transition(transition, window, cx);
@@ -4589,6 +4771,10 @@ impl Tty7App {
 
     pub(crate) fn set_remember_window_size(&mut self, on: bool, cx: &mut Context<Self>) {
         self.update_config(cx, |cfg| cfg.remember_window_size = on);
+    }
+
+    pub(crate) fn set_preserve_terminal_width(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.update_config(cx, |cfg| cfg.preserve_terminal_width = on);
     }
 
     pub(crate) fn sync_window_title(&self, window: &mut Window, cx: &App) {
@@ -7733,6 +7919,9 @@ impl Tty7App {
             L10nKey::SettingsRememberWindowSize => {
                 self.set_remember_window_size(defaults.remember_window_size, cx)
             }
+            L10nKey::SettingsPreserveTerminalWidth => {
+                self.set_preserve_terminal_width(defaults.preserve_terminal_width, cx)
+            }
             L10nKey::SettingsCheckUpdatesOnLaunch => {
                 self.set_check_for_updates(defaults.check_for_updates, cx)
             }
@@ -9988,7 +10177,12 @@ impl Render for Tty7App {
         // Asked through the predicate the right panel sizes itself against —
         // two spellings of "is the rail up" is one more than the layout can
         // afford to have disagree.
-        let rail = self.sidebar_open(cx);
+        let left_phase = self
+            .panel_resize_transition
+            .filter(|transition| matches!(transition.panel, DockPanel::Left))
+            .map(|transition| transition.phase);
+        let closing_left_panel = matches!(left_phase, Some(ResizePhase::PreparingClose));
+        let rail = self.sidebar_open(cx) || closing_left_panel;
         // A hover flag is only written by its sheet, and only on a change of
         // state it saw. A sheet that is not in the tree sees none: the rail
         // hidden by its own tile with the pointer on it, or the switch turned
@@ -10010,14 +10204,10 @@ impl Render for Tty7App {
         let tab_landing = self.tab_landing(window, cx);
         let detach_caret = self.detach_caret(window, cx);
         let strip = self.tab_strip(!vertical, window, cx);
-        // A left panel in transition is drawn as the placeholder once the
-        // window is on its way to the target size, and its content appears when
-        // the target is reached. Before an opening window has moved, the slot
-        // stays empty: the frame on screen must look as it did before the toggle.
-        let left_phase = self
-            .panel_resize_transition
-            .filter(|transition| matches!(transition.panel, DockPanel::Left))
-            .map(|transition| transition.phase);
+        // A left panel in transition is drawn as a placeholder once the window
+        // is on its way to the target size; its content appears at the target.
+        // Opening leaves the slot empty until then, while closing keeps the
+        // existing sidebar visible until the placeholder takes over.
         let left_panel_pending = matches!(
             left_phase,
             Some(ResizePhase::PreparingOpen | ResizePhase::AwaitingTarget)
@@ -12219,7 +12409,7 @@ mod tests {
     use gpui::{Edges, point, px, size};
 
     #[test]
-    fn left_panel_origin_shift_preserves_position_and_is_reversed_on_rollback() {
+    fn left_panel_native_origin_shift_is_reversed_on_rollback() {
         let closing = PanelResizeTransition {
             generation: 1,
             panel: DockPanel::Left,
@@ -12232,19 +12422,35 @@ mod tests {
                 sidebar_collapsed: false,
             },
             phase: ResizePhase::AwaitingTarget,
-            native_origin_shifted: false,
+            native_origin_delta: Some(px(240.)),
         };
         assert_eq!(
+            super::left_panel_native_resize_shift(&closing),
+            Some(px(240.)),
+            "closing the left panel atomically moves the frame right"
+        );
+        assert_eq!(
             super::left_panel_completion_origin_delta(&closing),
-            Some(px(240.))
+            None,
+            "a successful atomic close already applied its origin shift"
         );
 
         let opening = PanelResizeTransition {
             target_width: px(1240.),
-            native_origin_shifted: true,
+            phase: ResizePhase::PreparingOpen,
+            native_origin_delta: Some(px(-240.)),
             ..closing
         };
-        assert_eq!(super::left_panel_completion_origin_delta(&opening), None);
+        assert_eq!(
+            super::left_panel_native_resize_shift(&opening),
+            Some(px(-240.)),
+            "opening the left panel atomically moves the frame left"
+        );
+        assert_eq!(
+            super::left_panel_completion_origin_delta(&opening),
+            None,
+            "a successful atomic open already applied its origin shift"
+        );
 
         let rollback = PanelResizeTransition {
             target_width: closing.original_size.width,
@@ -12253,7 +12459,24 @@ mod tests {
         };
         assert_eq!(
             super::left_panel_completion_origin_delta(&rollback),
-            Some(px(240.))
+            Some(px(240.)),
+            "rollback reverses the opening shift"
+        );
+
+        let close_rollback = PanelResizeTransition {
+            target_width: closing.original_size.width,
+            phase: ResizePhase::RollingBack,
+            ..closing
+        };
+        assert_eq!(
+            super::left_panel_native_resize_shift(&close_rollback),
+            None,
+            "a rollback uses the normal resize path"
+        );
+        assert_eq!(
+            super::left_panel_completion_origin_delta(&close_rollback),
+            Some(px(-240.)),
+            "rollback reverses the closing shift"
         );
     }
 
@@ -12418,6 +12641,45 @@ mod tests {
         app.update_in(&mut visual, |app, window, cx| {
             app.toggle_left_panel(window, cx);
         });
+        let closing_stage = app.read_with(&visual, |app, _| {
+            app.panel_resize_transition
+                .map(|transition| transition.phase)
+        });
+        assert!(
+            matches!(closing_stage, Some(ResizePhase::PreparingClose)),
+            "closing keeps the sidebar in its current layout until native resize starts"
+        );
+        visual.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        let sidebar_bounds = visual
+            .debug_bounds("tab-sidebar")
+            .expect("the sidebar remains visible during close preparation");
+        assert!(
+            visual.debug_bounds("left-panel-placeholder").is_none(),
+            "close preparation keeps the sidebar rather than replacing it early"
+        );
+        visual.run_until_parked();
+        visual.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        assert!(
+            visual.debug_bounds("tab-sidebar").is_none(),
+            "the sidebar content waits for the target window size"
+        );
+        let placeholder_bounds = visual
+            .debug_bounds("left-panel-placeholder")
+            .expect("the placeholder preserves the sidebar column while the window closes");
+        assert_eq!(
+            placeholder_bounds.origin, sidebar_bounds.origin,
+            "the placeholder keeps the sidebar's horizontal position"
+        );
+        assert_eq!(
+            placeholder_bounds.size.width, sidebar_bounds.size.width,
+            "the placeholder keeps the sidebar's width"
+        );
         let target_width = app
             .read_with(&visual, |app, _| {
                 app.panel_resize_transition
@@ -12516,6 +12778,190 @@ mod tests {
                 && visual.debug_bounds("left-panel-placeholder").is_none(),
             "the sidebar replaces its placeholder once the target size is reached"
         );
+    }
+
+    #[gpui::test]
+    fn staged_panel_resize_uses_the_window_that_started_it(cx: &mut gpui::TestAppContext) {
+        use crate::core::config::{Config, TabBarPosition};
+        use crate::ui::app::test_window;
+
+        let (app, mut workspace, _pane_stream) = test_window::harness_with_pane(cx);
+        workspace.run_until_parked();
+        let settings_window = cx.add_window(|_, _| gpui::EmptyView);
+        let settings_visual = gpui::VisualTestContext::from_window(settings_window.into(), cx);
+        settings_visual.simulate_resize(size(px(960.), px(700.)));
+        settings_visual.run_until_parked();
+        let settings_width_before = settings_window
+            .update(cx, |_, window, _| window.viewport_size().width)
+            .expect("the settings window remains open");
+
+        workspace.update(|_, cx| {
+            let mut config = cx.global::<Config>().clone();
+            config.preserve_terminal_width = true;
+            config.tab_bar_position = TabBarPosition::Top;
+            config.sidebar_collapsed = true;
+            cx.set_global(config);
+        });
+        let workspace_width_before = workspace.update(|window, _| window.viewport_size().width);
+        app.update_in(&mut workspace, |app, window, cx| {
+            app.sidebar_collapsed = true;
+            app.settings_window = Some((settings_window.into(), window.window_handle()));
+            app.toggle_left_panel(window, cx);
+        });
+        let target_width = app.read_with(&workspace, |app, _| {
+            app.panel_resize_transition
+                .expect("opening the left panel starts a resize transition")
+                .target_width
+        });
+        settings_window
+            .update(cx, |_, window, _| window.activate_window())
+            .expect("the settings window remains open");
+        workspace.run_until_parked();
+
+        let workspace_width_after = workspace.update(|window, _| window.viewport_size().width);
+        let settings_width_after = settings_window
+            .update(cx, |_, window, _| window.viewport_size().width)
+            .expect("the settings window remains open");
+        let sidebar_open = app.read_with(&workspace, super::Tty7App::left_panel_open);
+
+        assert_eq!(
+            workspace_width_after, target_width,
+            "the staged transition resizes its originating workspace window"
+        );
+        assert_eq!(
+            settings_width_after, settings_width_before,
+            "the staged transition leaves the active settings window unchanged"
+        );
+        assert!(workspace_width_after > workspace_width_before);
+        assert!(sidebar_open);
+        app.update_in(&mut workspace, |app, _, _| app.settings_window = None);
+    }
+
+    #[gpui::test]
+    fn settings_tab_bar_and_repeated_left_panel_toggles_resize_workspace_only(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use crate::core::config::{Config, TabBarPosition};
+        use crate::ui::app::test_window;
+
+        let (app, mut visual, _pane_stream) = test_window::harness_with_pane(cx);
+        visual.run_until_parked();
+        let settings_window = cx.add_window(|_, _| gpui::EmptyView);
+        let settings_visual = gpui::VisualTestContext::from_window(settings_window.into(), cx);
+        settings_visual.simulate_resize(size(px(1500.), px(700.)));
+        settings_visual.run_until_parked();
+        let settings_width_before = settings_window
+            .update(cx, |_, window, _| window.viewport_size().width)
+            .expect("the settings window remains open");
+
+        visual.update(|_, cx| {
+            let mut config = cx.global::<Config>().clone();
+            config.preserve_terminal_width = true;
+            config.tab_bar_position = TabBarPosition::Top;
+            config.sidebar_collapsed = false;
+            cx.set_global(config);
+        });
+        app.update_in(&mut visual, |app, window, cx| {
+            app.sidebar_collapsed = false;
+            app.settings_window = Some((settings_window.into(), window.window_handle()));
+            cx.notify();
+        });
+        visual.run_until_parked();
+        let workspace_width_before = visual.update(|window, _| window.viewport_size().width);
+        assert_ne!(
+            settings_width_before, workspace_width_before,
+            "the settings and workspace windows have distinct test sizes"
+        );
+
+        settings_window
+            .update(cx, |_, settings_window, cx| {
+                app.update(cx, |app, cx| {
+                    app.set_tab_bar_position(TabBarPosition::Left, settings_window, cx)
+                });
+            })
+            .expect("the settings window remains open");
+        visual.run_until_parked();
+
+        let target_width = app
+            .read_with(&visual, |app, _| {
+                app.panel_resize_transition
+                    .map(|transition| transition.target_width)
+            })
+            .expect("the workspace tab bar change starts a resize transition");
+        let workspace_height = visual.update(|window, _| window.viewport_size().height);
+        visual.simulate_resize(size(target_width, workspace_height));
+        visual.run_until_parked();
+
+        let settings_width_after = settings_window
+            .update(cx, |_, window, _| window.viewport_size().width)
+            .expect("the settings window remains open");
+        let workspace_width_after = visual.update(|window, _| window.viewport_size().width);
+        let tab_bar_position =
+            app.read_with(&visual, |_, cx| cx.global::<Config>().tab_bar_position);
+
+        assert_eq!(
+            settings_width_after, settings_width_before,
+            "the settings window is not resized for the workspace sidebar"
+        );
+        assert!(
+            workspace_width_after > workspace_width_before,
+            "the workspace window grows to make room for the sidebar"
+        );
+        assert_eq!(tab_bar_position, TabBarPosition::Left);
+
+        let toggle_left_panel_key = visual
+            .update(|_, cx| crate::ui::keymap::effective_key("ToggleLeftPanel", cx))
+            .expect("the left panel key binding is available");
+        for press in 1..=3 {
+            let workspace_width_before_toggle =
+                visual.update(|window, _| window.viewport_size().width);
+            visual.simulate_keystrokes(&toggle_left_panel_key);
+            visual.run_until_parked();
+            let (transition_original_width, target_width) = app
+                .read_with(&visual, |app, _| {
+                    app.panel_resize_transition
+                        .map(|transition| (transition.original_size.width, transition.target_width))
+                })
+                .expect("Command+B starts a left-panel resize transition");
+            assert_eq!(
+                transition_original_width, workspace_width_before_toggle,
+                "Command+B press {press} sizes the transition from the workspace viewport"
+            );
+            let settings_width = settings_window
+                .update(cx, |_, window, _| window.viewport_size().width)
+                .expect("the settings window remains open");
+            assert_eq!(
+                settings_width, settings_width_before,
+                "Command+B press {press} does not resize the settings window"
+            );
+            let workspace_height = visual.update(|window, _| window.viewport_size().height);
+            visual.simulate_resize(size(target_width, workspace_height));
+            visual.run_until_parked();
+
+            let settings_width_after_toggle = settings_window
+                .update(cx, |_, window, _| window.viewport_size().width)
+                .expect("the settings window remains open");
+            let workspace_width = visual.update(|window, _| window.viewport_size().width);
+            assert_eq!(
+                settings_width_after_toggle, settings_width_before,
+                "Command+B press {press} leaves the settings window unchanged"
+            );
+            let sidebar_open = app.read_with(&visual, |app, cx| app.left_panel_open(cx));
+            let expected_sidebar_open = press % 2 == 0;
+            assert_eq!(
+                sidebar_open, expected_sidebar_open,
+                "Command+B press {press} toggles the workspace sidebar"
+            );
+            let expected_workspace_width = if expected_sidebar_open {
+                workspace_width_after
+            } else {
+                workspace_width_before
+            };
+            assert_eq!(
+                workspace_width, expected_workspace_width,
+                "Command+B press {press} leaves the workspace at its expected width"
+            );
+        }
     }
 
     #[test]

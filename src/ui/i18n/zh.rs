@@ -636,6 +636,8 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
         L10nKey::SettingsStartupWindowDesc => "tty7 启动时的窗口状态。",
         L10nKey::SettingsRememberWindowSize => "记住窗口大小与位置",
         L10nKey::SettingsRememberWindowSizeDesc => "按上次退出时的大小和位置打开窗口。",
+        L10nKey::SettingsPreserveTerminalWidth => "打开侧边栏时保持终端宽度",
+        L10nKey::SettingsPreserveTerminalWidthDesc => "打开侧边栏时调整窗口大小，而不是缩窄终端。",
         L10nKey::SettingsRestoreLastLayout => "恢复上次布局",
         L10nKey::SettingsRestoreLastLayoutDesc => "启动时恢复上次的标签页、分屏和目录。",
         L10nKey::SettingsShowTrayIcon => "显示托盘图标",

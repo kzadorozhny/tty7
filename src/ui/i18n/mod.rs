@@ -637,6 +637,8 @@ l10n_keys! {
     SettingsStartupWindowDesc,
     SettingsRememberWindowSize,
     SettingsRememberWindowSizeDesc,
+    SettingsPreserveTerminalWidth,
+    SettingsPreserveTerminalWidthDesc,
     SettingsRestoreLastLayout,
     SettingsRestoreLastLayoutDesc,
     SettingsShowTrayIcon,

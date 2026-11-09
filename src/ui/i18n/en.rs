@@ -729,6 +729,10 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::SettingsRememberWindowSizeDesc => {
             "Reopen where the window was when tty7 last quit."
         }
+        L10nKey::SettingsPreserveTerminalWidth => "Preserve terminal width when sidebars open",
+        L10nKey::SettingsPreserveTerminalWidthDesc => {
+            "Resize the window instead of narrowing the terminal when sidebars open."
+        }
         L10nKey::SettingsRestoreLastLayout => "Restore last layout",
         L10nKey::SettingsRestoreLastLayoutDesc => {
             "Reopen last session's tabs, splits and directories."
